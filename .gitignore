@@ -1,0 +1,44 @@
+# Environment and secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+id_rsa
+id_ed25519
+
+# Local databases and data
+data/
+*.sqlite
+*.sqlite3
+*.db
+*.duckdb
+storage/
+uploads/
+data/local/
+data/private/
+
+# Logs and runtime files
+logs/
+*.log
+*.pid
+
+# Caches and dependencies
+node_modules/
+.next/
+dist/
+build/
+coverage/
+.cache/
+.turbo/
+.pytest_cache/
+__pycache__/
+*.pyc
+
+# OS/editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
