@@ -2,6 +2,7 @@ import { getCollector } from "../collectors/index.js";
 import {
   addCaptureLog,
   createCaptureJob,
+  expireStaleCaptureJobs,
   getCaptureJob,
   listDueAccounts,
   markJobFinished,
@@ -14,22 +15,39 @@ export async function runCaptureJob(jobId) {
   const job = getCaptureJob(jobId);
   if (!job) throw new Error("采集任务不存在");
   if (job.status === "running") return job;
+  if (!job.is_active) {
+    markJobFinished(jobId, {
+      status: "skipped",
+      error_code: "ACCOUNT_INACTIVE",
+      error_message: "账号已删除，跳过采集"
+    });
+    return getCaptureJob(jobId);
+  }
 
-  markJobRunning(jobId);
+  if (!markJobRunning(jobId)) return getCaptureJob(jobId);
   addCaptureLog(jobId, "info", "采集任务开始", { trigger_type: job.trigger_type });
 
   try {
     const collector = getCollector(job.platform_code);
-    const result = await collector(job);
+    const result = await withTimeout(
+      collector(job),
+      getCaptureJobTimeoutMs(),
+      `采集超过最长运行时间 ${Math.round(getCaptureJobTimeoutMs() / 60000)} 分钟，系统已自动结束。`
+    );
+    const currentJob = getCaptureJob(jobId);
+    if (!currentJob?.is_active || currentJob.status === "skipped") return currentJob;
 
     saveCaptureResult(job, result);
     markJobFinished(jobId, result);
     addCaptureLog(jobId, result.status === "failed" ? "error" : "info", "采集任务结束", result);
     return getCaptureJob(jobId);
   } catch (error) {
+    const currentJob = getCaptureJob(jobId);
+    if (!currentJob?.is_active || currentJob.status === "skipped") return currentJob;
+
     const result = {
       status: "failed",
-      error_code: "UNKNOWN_ERROR",
+      error_code: error.code || "UNKNOWN_ERROR",
       error_message: error.message
     };
     markJobFinished(jobId, result);
@@ -38,9 +56,37 @@ export async function runCaptureJob(jobId) {
   }
 }
 
+function getCaptureJobTimeoutMs() {
+  const configured = Number(process.env.CAPTURE_JOB_TIMEOUT_MS);
+  return Number.isFinite(configured) && configured > 0 ? configured : 12 * 60 * 1000;
+}
+
+function withTimeout(promise, timeoutMs, message) {
+  let timer = null;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => {
+      const error = new Error(message);
+      error.code = "CAPTURE_TIMEOUT";
+      reject(error);
+    }, timeoutMs);
+  });
+
+  return Promise.race([promise, timeout]).finally(() => {
+    if (timer) clearTimeout(timer);
+  });
+}
+
 export async function enqueueAndRun(accountId, triggerType = "manual_now") {
   const job = createCaptureJob(accountId, triggerType);
   return runCaptureJob(job.id);
+}
+
+export function enqueueAndStart(accountId, triggerType = "manual_now") {
+  const job = createCaptureJob(accountId, triggerType);
+  runCaptureJob(job.id).catch((error) => {
+    console.error("[capture] background job failed", error);
+  });
+  return getCaptureJob(job.id);
 }
 
 export async function scheduleDueCaptures() {
@@ -62,6 +108,7 @@ export async function runDueCaptures() {
   if (schedulerRunning) return [];
   schedulerRunning = true;
   try {
+    expireStaleCaptureJobs();
     const jobs = await scheduleDueCaptures();
     const finished = [];
     for (const job of jobs) {

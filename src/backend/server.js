@@ -3,9 +3,13 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { initDatabase, getDbPath } from "./db/database.js";
 import {
+  clearAccountCaptureData,
   createAccount,
+  deleteAccount,
   getOverview,
+  listAccountDashboardRows,
   listHotVideos,
+  listTopLikedVideos,
   listAccounts,
   listCaptureJobs,
   listPlatforms,
@@ -16,14 +20,17 @@ import {
   exportDailyChangesExcel,
   exportVideosCsv,
   exportVideosExcel,
+  failInterruptedCaptureJobs,
   updateAccount
 } from "./services/repository.js";
-import { enqueueAndRun, runDueCaptures } from "./services/captureRunner.js";
+import { enqueueAndStart, runDueCaptures } from "./services/captureRunner.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const rootDir = path.resolve(__dirname, "../..");
 
 initDatabase();
+const interruptedJobs = failInterruptedCaptureJobs();
+if (interruptedJobs) console.log(`[startup] closed ${interruptedJobs} interrupted capture job(s)`);
 
 const app = express();
 app.use(express.json({ limit: "1mb" }));
@@ -44,6 +51,10 @@ app.get("/api/accounts", (req, res) => {
   res.json(listAccounts(req.query));
 });
 
+app.get("/api/accounts/dashboard", (req, res) => {
+  res.json(listAccountDashboardRows());
+});
+
 app.post("/api/accounts", (req, res, next) => {
   try {
     res.status(201).json(createAccount(req.body));
@@ -60,9 +71,25 @@ app.patch("/api/accounts/:id", (req, res, next) => {
   }
 });
 
+app.delete("/api/accounts/:id", (req, res, next) => {
+  try {
+    res.json(deleteAccount(Number(req.params.id)));
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/api/accounts/:id/clear-data", (req, res, next) => {
+  try {
+    res.json(clearAccountCaptureData(Number(req.params.id)));
+  } catch (error) {
+    next(error);
+  }
+});
+
 app.post("/api/accounts/:id/capture", async (req, res, next) => {
   try {
-    const job = await enqueueAndRun(Number(req.params.id), "manual_now");
+    const job = enqueueAndStart(Number(req.params.id), "manual_now");
     res.json(job);
   } catch (error) {
     next(error);
@@ -88,6 +115,10 @@ app.get("/api/videos", (req, res) => {
 
 app.get("/api/hot-videos", (req, res) => {
   res.json(listHotVideos(req.query.limit));
+});
+
+app.get("/api/videos/top-liked", (req, res) => {
+  res.json(listTopLikedVideos(req.query.limit));
 });
 
 app.get("/api/videos/export.csv", (req, res) => {
@@ -141,8 +172,8 @@ app.use((error, req, res, next) => {
   res.status(400).json({ error: error.message || "请求失败" });
 });
 
-const port = Number(process.env.API_PORT || 3001);
-const host = process.env.API_HOST || "0.0.0.0";
+const port = Number(process.env.API_PORT || process.env.BACKEND_PORT || 8102);
+const host = process.env.API_HOST || process.env.BACKEND_HOST || "0.0.0.0";
 app.listen(port, host, () => {
   console.log(`API server listening at http://${host}:${port}`);
   startLocalScheduler();

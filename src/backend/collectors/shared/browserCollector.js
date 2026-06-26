@@ -18,7 +18,9 @@ const messages = {
   noMetrics:
     "\u516c\u5f00\u9875\u9762\u53ef\u8bbf\u95ee\uff0c\u4f46\u672a\u8bc6\u522b\u5230\u7c89\u4e1d\u91cf\u6216\u516c\u5f00\u89c6\u9891\u6307\u6807\u3002",
   linksOnly:
-    "\u53ea\u8bc6\u522b\u5230\u516c\u5f00\u94fe\u63a5\uff0c\u672a\u8bc6\u522b\u5230\u7c89\u4e1d\u91cf\u3001\u70b9\u8d5e\u3001\u8bc4\u8bba\u3001\u6536\u85cf\u7b49\u6838\u5fc3\u6307\u6807\u3002"
+    "\u53ea\u8bc6\u522b\u5230\u516c\u5f00\u94fe\u63a5\uff0c\u672a\u8bc6\u522b\u5230\u7c89\u4e1d\u91cf\u3001\u70b9\u8d5e\u3001\u8bc4\u8bba\u3001\u6536\u85cf\u7b49\u6838\u5fc3\u6307\u6807\u3002",
+  followerMissing:
+    "\u5df2\u91c7\u96c6\u5230\u89c6\u9891\u516c\u5f00\u6307\u6807\uff0c\u4f46\u672a\u8bc6\u522b\u5230\u8d26\u53f7\u4e3b\u9875\u7c89\u4e1d\u6570\uff1b\u53ef\u80fd\u662f\u5e73\u53f0\u61d2\u52a0\u8f7d\u3001\u9875\u9762\u672a\u66b4\u9732\u6216\u9700\u8981\u767b\u5f55\u540e\u624d\u663e\u793a\u3002"
 };
 
 const blockedPatterns = [
@@ -49,13 +51,12 @@ export async function collectPublicPage(account, options = {}) {
       waitUntil: "domcontentloaded",
       timeout: Number(process.env.CAPTURE_TIMEOUT_MS || 30000)
     });
-    await page.waitForTimeout(Number(process.env.CAPTURE_SETTLE_MS || 2500));
-
     const profileCheck = await checkBlocked(page);
     if (profileCheck) return failedResult(account, capturedAt, profileCheck.code, profileCheck.message);
 
-    await waitForProfileVideos(page);
-    const profileText = await getBodyText(page);
+    const readyCheck = await waitForProfileReady(page, limit);
+    if (readyCheck) return failedResult(account, capturedAt, readyCheck.code, readyCheck.message);
+    const profileText = await getProfileText(page);
     const follower = extractFollower(profileText);
     const profileUrl = page.url();
     const profileVideos = await extractDouyinProfileVideos(page, limit);
@@ -76,6 +77,8 @@ export async function collectPublicPage(account, options = {}) {
     );
     const hasOnlyLinks = videos.length > 0 && !hasFollower && !hasVideoMetric;
     const status = hasFollower || hasVideoMetric ? "success" : hasOnlyLinks ? "partial_success" : "failed";
+    const warningMessage =
+      status === "success" && hasVideoMetric && !hasFollower ? messages.followerMissing : null;
 
     return {
       platform: account.platform_code,
@@ -89,7 +92,7 @@ export async function collectPublicPage(account, options = {}) {
       videos,
       status,
       error_code: status === "success" ? null : "FIELD_NOT_PUBLIC",
-      error_message: status === "success" ? null : hasOnlyLinks ? messages.linksOnly : messages.noMetrics,
+      error_message: warningMessage || (status === "success" ? null : hasOnlyLinks ? messages.linksOnly : messages.noMetrics),
       captured_at: capturedAt
     };
   } catch (error) {
@@ -106,7 +109,6 @@ async function collectVideoDetail(page, item) {
       timeout: Number(process.env.CAPTURE_TIMEOUT_MS || 30000)
     });
     await waitForVideoDetailContent(page, item.title);
-    await page.waitForTimeout(Number(process.env.CAPTURE_DETAIL_WAIT_MS || 800));
 
     const blocked = await checkBlocked(page);
     if (blocked) return { ...item, ...emptyVideoMetrics("failed"), raw_metric_text: blocked.message };
@@ -182,16 +184,36 @@ async function extractDouyinProfileVideos(page, limit) {
   return videos;
 }
 
-async function waitForProfileVideos(page) {
+async function waitForProfileReady(page, limit) {
   const settle = Number(process.env.CAPTURE_SETTLE_MS || 2500);
+  const timeout = Number(process.env.CAPTURE_PROFILE_READY_TIMEOUT_MS || 15000);
+  const targetVideoCount = Math.min(Math.max(1, Number(limit) || 10), 30);
+  const started = Date.now();
+  let bestVideoCount = 0;
+
   await page.waitForTimeout(settle);
 
-  for (let attempt = 0; attempt < 8; attempt += 1) {
-    const count = await page.locator('a[href*="/video/"]').count().catch(() => 0);
-    if (count >= 30) return;
+  while (Date.now() - started < timeout) {
+    const blocked = await checkBlocked(page);
+    if (blocked) return blocked;
+
+    const text = await getProfileText(page);
+    const follower = extractFollower(text);
+    const videoCount = await page.locator('a[href*="/video/"]').count().catch(() => 0);
+    bestVideoCount = Math.max(bestVideoCount, videoCount);
+
+    if (follower.status === "available" && videoCount >= targetVideoCount) return null;
+    if (follower.status === "available" && bestVideoCount > 0 && Date.now() - started >= Math.max(settle, 6000)) return null;
+    if (videoCount >= targetVideoCount && hasProfileIdentityText(text) && Date.now() - started >= Math.max(settle, 6000)) {
+      return null;
+    }
+
     await page.mouse.wheel(0, 900).catch(() => {});
-    await page.waitForTimeout(1200);
+    await page.waitForTimeout(1000);
   }
+
+  if (bestVideoCount === 0) await page.waitForTimeout(1000);
+  return null;
 }
 
 async function waitForVideoDetailContent(page, title) {
@@ -207,6 +229,27 @@ async function waitForVideoDetailContent(page, title) {
       { timeout: Number(process.env.CAPTURE_DETAIL_READY_TIMEOUT_MS || 8000) }
     )
     .catch(() => {});
+
+  const timeout = Number(process.env.CAPTURE_DETAIL_METRIC_TIMEOUT_MS || 8000);
+  const minWait = Number(process.env.CAPTURE_DETAIL_WAIT_MS || 800);
+  const started = Date.now();
+  while (Date.now() - started < timeout) {
+    const text = await getBodyText(page);
+    const lines = text
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter(Boolean);
+    const metrics = parseDetailMetrics(lines, title);
+    if (
+      metrics.like_count != null ||
+      metrics.comment_count != null ||
+      metrics.favorite_count != null ||
+      (Date.now() - started >= minWait && /\u53d1\u5e03\u65f6\u95f4/.test(text))
+    ) {
+      return;
+    }
+    await page.waitForTimeout(800);
+  }
 }
 
 function parseProfileVideoText(text) {
@@ -301,16 +344,45 @@ function normalizeText(value) {
   return String(value || "").replace(/\s+/g, "");
 }
 
+function hasProfileIdentityText(text) {
+  return /\u6296\u97f3\u53f7|\u4f5c\u54c1|\u7c89\u4e1d|\u83b7\u8d5e|followers/i.test(String(text || ""));
+}
+
 function extractPublishedAt(text) {
   const match = String(text || "").match(/\u53d1\u5e03\u65f6\u95f4[\uff1a:\s]*([0-9]{4}-[0-9]{2}-[0-9]{2}\s+[0-9:]{5,8})/);
   return match ? match[1] : null;
 }
 
-function extractFollower(text) {
+export function extractFollower(text) {
   const compact = String(text || "").replace(/\s+/g, "");
-  const combined = compact.match(/\u7c89\u4e1d(\d+(?:\.\d+)?\s*(?:\u4e07|w|W|\u4ebf)?\+?)\u83b7\u8d5e/);
-  if (combined) return parseMetricLine(combined[1]);
-  return extractFirstMetric(text, ["\u7c89\u4e1d", "followers"]);
+  const metricPattern = "([0-9]+(?:\\.[0-9]+)?(?:\\u4e07|w|W|\\u4ebf)?\\+?)";
+  const anchoredPatterns = [
+    new RegExp(`\\u5173\\u6ce8${metricPattern}\\u7c89\\u4e1d${metricPattern}\\u83b7\\u8d5e`),
+    new RegExp(`\\u7c89\\u4e1d${metricPattern}\\u83b7\\u8d5e`),
+    new RegExp(`followers${metricPattern}`, "i")
+  ];
+
+  for (const pattern of anchoredPatterns) {
+    const match = compact.match(pattern);
+    if (!match) continue;
+    const candidate = pattern === anchoredPatterns[0] ? match[2] : match[1];
+    const parsed = parseMetricLine(candidate);
+    if (parsed.status === "available") return parsed;
+  }
+
+  const lines = String(text || "")
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+  for (const line of lines) {
+    if (!/\u7c89\u4e1d|followers/i.test(line) || /\u6296\u97f3\u53f7/.test(line)) continue;
+    const match = line.match(new RegExp(`(?:\\u7c89\\u4e1d|followers)\\s*${metricPattern}`, "i"));
+    if (!match) continue;
+    const parsed = parseMetricLine(match[1]);
+    if (parsed.status === "available") return parsed;
+  }
+
+  return { value: null, status: "not_public", raw: "" };
 }
 
 function inferAccountName(text, fallback) {
@@ -330,6 +402,33 @@ async function checkBlocked(page) {
     if (pattern.test(text) || pattern.test(title)) return { code, message };
   }
   return null;
+}
+
+async function getProfileText(page) {
+  const bodyText = await getBodyText(page);
+  const domText = await page
+    .evaluate(() => {
+      const texts = new Set();
+      const clean = (value) => String(value || "").replace(/\s+/g, " ").trim();
+      const bodyContent = clean(document.body?.textContent || "");
+      if (bodyContent) texts.add(bodyContent);
+
+      for (const node of document.querySelectorAll("*")) {
+        const text = clean(node.textContent || "");
+        if (!text || !/粉丝|获赞|关注|followers/i.test(text)) continue;
+
+        const parentText = clean(node.parentElement?.textContent || "");
+        const grandText = clean(node.parentElement?.parentElement?.textContent || "");
+        texts.add(text);
+        if (parentText) texts.add(parentText);
+        if (grandText) texts.add(grandText);
+      }
+
+      return Array.from(texts).join("\n");
+    })
+    .catch(() => "");
+
+  return [bodyText, domText].filter(Boolean).join("\n");
 }
 
 async function getBodyText(page) {

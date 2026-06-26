@@ -1,5 +1,5 @@
 import { collectPublicPage } from "../shared/browserCollector.js";
 
 export async function collectShipinhao(account) {
-  return collectPublicPage(account, { limit: Number(process.env.CAPTURE_VIDEO_LIMIT || 20) });
+  return collectPublicPage(account, { limit: account.capture_video_limit || Number(process.env.CAPTURE_VIDEO_LIMIT || 10) });
 }

@@ -24,6 +24,7 @@ data/private/
 logs/
 *.log
 *.pid
+.project-ports.lock
 
 # Caches and dependencies
 node_modules/
@@ -31,6 +32,7 @@ node_modules/
 dist/
 build/
 coverage/
+output/
 .cache/
 .turbo/
 .pytest_cache/

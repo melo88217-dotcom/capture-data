@@ -21,6 +21,7 @@ export const api = {
   overview: () => request("/overview"),
   platforms: () => request("/platforms"),
   accounts: () => request("/accounts"),
+  accountDashboardRows: () => request("/accounts/dashboard"),
   createAccount: (payload) =>
     request("/accounts", {
       method: "POST",
@@ -33,10 +34,13 @@ export const api = {
       headers: jsonHeaders,
       body: JSON.stringify(payload)
     }),
+  deleteAccount: (id) => request(`/accounts/${id}`, { method: "DELETE" }),
+  clearAccountData: (id) => request(`/accounts/${id}/clear-data`, { method: "POST" }),
   captureAccount: (id) => request(`/accounts/${id}/capture`, { method: "POST" }),
   runDue: () => request("/scheduler/run-due", { method: "POST" }),
   jobs: () => request("/jobs"),
   videos: (filters = {}) => request(withQuery("/videos", filters)),
+  topLikedVideos: (filters = {}) => request(withQuery("/videos/top-liked", filters)),
   hotVideos: () => request("/hot-videos"),
   videoExportUrl: (filters = {}) => `/api${withQuery("/videos/export.csv", filters)}`,
   videoExcelExportUrl: (filters = {}) => `/api${withQuery("/videos/export.xls", filters)}`,

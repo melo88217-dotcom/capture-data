@@ -5,18 +5,22 @@
   "type": "module",
   "scripts": {
     "dev": "node scripts/dev.mjs",
+    "dev:safe": "node scripts/dev-safe.cjs",
     "dev:api": "node src/backend/server.js",
-    "dev:web": "vite --host 0.0.0.0 --port 3000",
+    "dev:web": "vite --host 0.0.0.0",
     "build": "vite build",
+    "test": "node --test",
     "preview": "vite preview --host 0.0.0.0 --port 3000",
     "check": "npm run build"
   },
   "dependencies": {
     "@vitejs/plugin-react": "^5.1.1",
+    "chart.js": "^4.5.1",
     "express": "^5.2.1",
     "lucide-react": "^0.561.0",
     "playwright": "^1.57.0",
     "react": "^19.2.3",
+    "react-chartjs-2": "^5.3.1",
     "react-dom": "^19.2.3",
     "vite": "^8.0.16"
   }

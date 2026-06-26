@@ -38,6 +38,7 @@ export function initDatabase() {
       notes TEXT,
       capture_frequency TEXT NOT NULL DEFAULT 'daily',
       preferred_capture_time TEXT NOT NULL DEFAULT '09:00',
+      capture_video_limit INTEGER NOT NULL DEFAULT 10,
       like_alert_threshold INTEGER NOT NULL DEFAULT 0,
       is_active INTEGER NOT NULL DEFAULT 1,
       latest_follower_count INTEGER,
@@ -141,6 +142,7 @@ export function initDatabase() {
   insertPlatform.run("douyin", "抖音");
   insertPlatform.run("shipinhao", "视频号");
   ensureColumn("accounts", "preferred_capture_time", "TEXT NOT NULL DEFAULT '09:00'");
+  ensureColumn("accounts", "capture_video_limit", "INTEGER NOT NULL DEFAULT 10");
   ensureColumn("accounts", "like_alert_threshold", "INTEGER NOT NULL DEFAULT 0");
 }
 

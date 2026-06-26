@@ -14,6 +14,12 @@ function sqlValue(value) {
   return value === undefined ? null : value;
 }
 
+function normalizeCaptureVideoLimit(value, fallback = 10) {
+  const parsed = Number(value ?? fallback);
+  if (!Number.isFinite(parsed)) return fallback;
+  return Math.max(1, Math.min(100, Math.round(parsed)));
+}
+
 export function listPlatforms() {
   return db.prepare("SELECT * FROM platforms WHERE enabled = 1 ORDER BY id").all();
 }
@@ -26,7 +32,7 @@ export function listAccounts(filters = {}) {
     clauses.push("p.code = ?");
     params.push(filters.platform);
   }
-  if (filters.status === "active") clauses.push("a.is_active = 1");
+  if (!filters.status || filters.status === "active") clauses.push("a.is_active = 1");
   if (filters.status === "inactive") clauses.push("a.is_active = 0");
 
   const where = clauses.length ? `WHERE ${clauses.join(" AND ")}` : "";
@@ -41,13 +47,49 @@ export function createAccount(payload) {
   const platform = db.prepare("SELECT id FROM platforms WHERE code = ?").get(payload.platform);
   if (!platform) throw new Error("平台不存在");
 
+  const existing = db
+    .prepare("SELECT id, is_active FROM accounts WHERE platform_id = ? AND profile_url = ?")
+    .get(platform.id, payload.profile_url);
+
+  if (existing?.is_active) throw new Error("账号已存在");
+
+  if (existing) {
+    db.prepare(
+      `
+      UPDATE accounts
+      SET display_name = ?,
+          category = ?,
+          tags = ?,
+          notes = ?,
+          capture_frequency = ?,
+          preferred_capture_time = ?,
+          capture_video_limit = ?,
+          like_alert_threshold = ?,
+          is_active = 1,
+          updated_at = CURRENT_TIMESTAMP
+      WHERE id = ?
+    `
+    ).run(
+      payload.display_name,
+      payload.category || "",
+      payload.tags || "",
+      payload.notes || "",
+      payload.capture_frequency || "daily",
+      payload.preferred_capture_time || "09:00",
+      normalizeCaptureVideoLimit(payload.capture_video_limit),
+      Number(payload.like_alert_threshold || 0),
+      existing.id
+    );
+    return getAccount(existing.id);
+  }
+
   const info = db
     .prepare(
       `
       INSERT INTO accounts (
-        platform_id, display_name, profile_url, category, tags, notes, capture_frequency, preferred_capture_time, like_alert_threshold, is_active
+        platform_id, display_name, profile_url, category, tags, notes, capture_frequency, preferred_capture_time, capture_video_limit, like_alert_threshold, is_active
       )
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `
     )
     .run(
@@ -59,6 +101,7 @@ export function createAccount(payload) {
       payload.notes || "",
       payload.capture_frequency || "daily",
       payload.preferred_capture_time || "09:00",
+      normalizeCaptureVideoLimit(payload.capture_video_limit),
       Number(payload.like_alert_threshold || 0),
       payload.is_active === false ? 0 : 1
     );
@@ -85,6 +128,7 @@ export function updateAccount(id, payload) {
           notes = ?,
           capture_frequency = ?,
           preferred_capture_time = ?,
+          capture_video_limit = ?,
           like_alert_threshold = ?,
           is_active = ?,
           updated_at = CURRENT_TIMESTAMP
@@ -99,6 +143,7 @@ export function updateAccount(id, payload) {
     payload.notes ?? current.notes,
     payload.capture_frequency ?? current.capture_frequency,
     payload.preferred_capture_time ?? current.preferred_capture_time ?? "09:00",
+    normalizeCaptureVideoLimit(payload.capture_video_limit, current.capture_video_limit ?? 10),
     Number(payload.like_alert_threshold ?? current.like_alert_threshold ?? 0),
     payload.is_active == null ? current.is_active : payload.is_active ? 1 : 0,
     id
@@ -107,9 +152,101 @@ export function updateAccount(id, payload) {
   return getAccount(id);
 }
 
+export function deleteAccount(id) {
+  const current = getAccount(id);
+  if (!current) throw new Error("账号不存在");
+
+  db.prepare(
+    `
+      UPDATE accounts
+      SET is_active = 0,
+          updated_at = CURRENT_TIMESTAMP
+      WHERE id = ?
+    `
+  ).run(id);
+
+  db.prepare(
+    `
+      UPDATE capture_jobs
+      SET status = 'skipped',
+          finished_at = ?,
+          error_code = 'ACCOUNT_INACTIVE',
+          error_message = '账号已删除，跳过未执行采集',
+          updated_at = CURRENT_TIMESTAMP
+      WHERE account_id = ?
+        AND status IN ('pending', 'running')
+    `
+  ).run(nowIso(), id);
+
+  return getAccount(id);
+}
+
+export function clearAccountCaptureData(id) {
+  const current = getAccount(id);
+  if (!current) throw new Error("账号不存在");
+  if (!current.is_active) throw new Error("账号已删除");
+
+  db.exec("BEGIN");
+  try {
+    db.prepare(
+      `
+      DELETE FROM capture_logs
+      WHERE job_id IN (
+        SELECT id FROM capture_jobs WHERE account_id = ?
+      )
+    `
+    ).run(id);
+    const deletedVideoSnapshots = db.prepare(
+      `
+      DELETE FROM video_snapshots
+      WHERE video_id IN (
+        SELECT id FROM videos WHERE account_id = ?
+      )
+    `
+    ).run(id).changes;
+    const deletedVideos = db.prepare("DELETE FROM videos WHERE account_id = ?").run(id).changes;
+    const deletedAccountSnapshots = db
+      .prepare("DELETE FROM account_snapshots WHERE account_id = ?")
+      .run(id).changes;
+    const deletedWeeklySummaries = db
+      .prepare("DELETE FROM weekly_summaries WHERE account_id = ?")
+      .run(id).changes;
+    const deletedJobs = db.prepare("DELETE FROM capture_jobs WHERE account_id = ?").run(id).changes;
+
+    db.prepare(
+      `
+      UPDATE accounts
+      SET latest_follower_count = NULL,
+          latest_collect_status = 'unknown',
+          last_captured_at = NULL,
+          updated_at = CURRENT_TIMESTAMP
+      WHERE id = ?
+    `
+    ).run(id);
+    db.exec("COMMIT");
+
+    return {
+      account: getAccount(id),
+      deleted: {
+        videos: deletedVideos,
+        video_snapshots: deletedVideoSnapshots,
+        account_snapshots: deletedAccountSnapshots,
+        weekly_summaries: deletedWeeklySummaries,
+        capture_jobs: deletedJobs
+      }
+    };
+  } catch (error) {
+    db.exec("ROLLBACK");
+    throw error;
+  }
+}
+
 export function createCaptureJob(accountId, triggerType = "manual_now", scheduledAt = nowIso()) {
   const account = getAccount(accountId);
   if (!account) throw new Error("账号不存在");
+  if (!account.is_active) throw new Error("账号已删除，不再采集");
+
+  expireStaleCaptureJobs({ accountId });
 
   const running = db
     .prepare(
@@ -128,6 +265,50 @@ export function createCaptureJob(accountId, triggerType = "manual_now", schedule
     .run(accountId, account.platform_id, triggerType === "manual_now" ? "manual" : "scheduled", triggerType, scheduledAt);
 
   return getCaptureJob(info.lastInsertRowid);
+}
+
+export function expireStaleCaptureJobs({ accountId = null, maxAgeMs = getStaleJobMs(), now = new Date() } = {}) {
+  const cutoff = new Date(now.getTime() - maxAgeMs).toISOString();
+  const params = [now.toISOString(), cutoff];
+  const accountClause = accountId ? " AND account_id = ?" : "";
+  if (accountId) params.push(accountId);
+
+  return db
+    .prepare(
+      `
+      UPDATE capture_jobs
+      SET status = 'failed',
+          finished_at = ?,
+          error_code = 'CAPTURE_TIMEOUT',
+          error_message = '采集任务超过最长运行时间，系统已自动结束，可重新采集。',
+          updated_at = CURRENT_TIMESTAMP
+      WHERE status = 'running'
+        AND datetime(COALESCE(started_at, updated_at, created_at)) <= datetime(?)
+        ${accountClause}
+    `
+    )
+    .run(...params).changes;
+}
+
+export function failInterruptedCaptureJobs(now = new Date()) {
+  return db
+    .prepare(
+      `
+      UPDATE capture_jobs
+      SET status = 'failed',
+          finished_at = ?,
+          error_code = 'CAPTURE_INTERRUPTED',
+          error_message = '服务重启或采集进程中断，系统已自动结束该任务，可重新采集。',
+          updated_at = CURRENT_TIMESTAMP
+      WHERE status = 'running'
+    `
+    )
+    .run(now.toISOString()).changes;
+}
+
+function getStaleJobMs() {
+  const configured = Number(process.env.CAPTURE_JOB_STALE_MS);
+  return Number.isFinite(configured) && configured > 0 ? configured : 2 * 60 * 60 * 1000;
 }
 
 export function getCaptureJob(id) {
@@ -165,6 +346,7 @@ export function listCaptureJobs(limit = 80) {
       FROM capture_jobs j
       JOIN accounts a ON a.id = j.account_id
       JOIN platforms p ON p.id = j.platform_id
+      WHERE a.is_active = 1
       ORDER BY j.created_at DESC
       LIMIT ?
     `
@@ -173,7 +355,7 @@ export function listCaptureJobs(limit = 80) {
 }
 
 function buildVideoFilters(filters = {}) {
-  const clauses = [];
+  const clauses = ["a.is_active = 1"];
   const params = [];
 
   if (filters.account_id) {
@@ -210,9 +392,14 @@ export function listDueAccounts() {
 }
 
 export function markJobRunning(jobId) {
-  db.prepare(
-    "UPDATE capture_jobs SET status = 'running', started_at = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?"
+  const result = db.prepare(
+    `
+      UPDATE capture_jobs
+      SET status = 'running', started_at = ?, updated_at = CURRENT_TIMESTAMP
+      WHERE id = ? AND status = 'pending'
+    `
   ).run(nowIso(), jobId);
+  return result.changes > 0;
 }
 
 export function markJobFinished(jobId, result) {
@@ -414,6 +601,7 @@ export function listHotVideos(limit = 120) {
         LIMIT 1
       )
       WHERE a.like_alert_threshold > 0
+        AND a.is_active = 1
         AND vs.like_count IS NOT NULL
         AND vs.like_count >= a.like_alert_threshold
       ORDER BY vs.like_count DESC, datetime(v.published_at) DESC
@@ -421,6 +609,65 @@ export function listHotVideos(limit = 120) {
     `
     )
     .all(parseLimit(limit, 120));
+}
+
+export function listAccountDashboardRows() {
+  return db
+    .prepare(
+      `
+      SELECT
+        a.*,
+        p.code AS platform_code,
+        p.name AS platform_name,
+        COUNT(DISTINCT v.id) AS video_count,
+        COUNT(DISTINCT CASE
+          WHEN v.published_at IS NOT NULL
+            AND date(v.published_at, 'localtime') >= date('now', 'localtime', '-6 days')
+          THEN v.id
+        END) AS recent_video_count
+      FROM accounts a
+      JOIN platforms p ON p.id = a.platform_id
+      LEFT JOIN videos v ON v.account_id = a.id
+      WHERE a.is_active = 1
+      GROUP BY a.id
+      ORDER BY a.updated_at DESC
+    `
+    )
+    .all();
+}
+
+export function listTopLikedVideos(limit = 5) {
+  return db
+    .prepare(
+      `
+      SELECT
+        v.*,
+        a.display_name AS account_name,
+        p.name AS platform_name,
+        p.code AS platform_code,
+        vs.like_count,
+        vs.comment_count,
+        vs.favorite_count,
+        vs.like_count_status,
+        vs.comment_count_status,
+        vs.favorite_count_status,
+        vs.captured_at
+      FROM videos v
+      JOIN accounts a ON a.id = v.account_id
+      JOIN platforms p ON p.id = a.platform_id
+      JOIN video_snapshots vs ON vs.id = (
+        SELECT id FROM video_snapshots
+        WHERE video_id = v.id
+        ORDER BY captured_at DESC
+        LIMIT 1
+      )
+      WHERE a.is_active = 1
+        AND vs.like_count IS NOT NULL
+      ORDER BY vs.like_count DESC, datetime(v.published_at) DESC, datetime(v.updated_at) DESC
+      LIMIT ?
+    `
+    )
+    .all(parseLimit(limit, 5));
 }
 
 export function exportVideosCsv(filters = {}) {
@@ -498,7 +745,9 @@ export function exportVideosExcel(filters = {}) {
 }
 
 export function listDailyChanges(filters = {}) {
-  const accounts = filters.account_id ? [getAccount(Number(filters.account_id))].filter(Boolean) : listAccounts();
+  const accounts = filters.account_id
+    ? [getAccount(Number(filters.account_id))].filter((account) => account?.is_active)
+    : listAccounts();
   const rows = [];
 
   for (const account of accounts) {
@@ -537,12 +786,26 @@ export function listDailyChanges(filters = {}) {
 }
 
 function buildDailyRow(account, day) {
-  const snapshot = db
+  const latestSnapshot = db
     .prepare(
       `
       SELECT *
       FROM account_snapshots
       WHERE account_id = ? AND date(captured_at, 'localtime') = ?
+      ORDER BY captured_at DESC
+      LIMIT 1
+    `
+    )
+    .get(account.id, day);
+  const followerSnapshot = db
+    .prepare(
+      `
+      SELECT *
+      FROM account_snapshots
+      WHERE account_id = ?
+        AND date(captured_at, 'localtime') = ?
+        AND follower_count IS NOT NULL
+        AND follower_count_status = 'available'
       ORDER BY captured_at DESC
       LIMIT 1
     `
@@ -576,12 +839,12 @@ function buildDailyRow(account, day) {
 
   return {
     day,
-    captured_at: snapshot?.captured_at || getDailyVideoCapturedAt(account.id, day),
+    captured_at: latestSnapshot?.captured_at || getDailyVideoCapturedAt(account.id, day),
     account_id: account.id,
     account_name: account.display_name,
     platform_name: account.platform_name,
-    follower_count: snapshot?.follower_count ?? null,
-    follower_count_status: snapshot?.follower_count_status || "not_public",
+    follower_count: followerSnapshot?.follower_count ?? null,
+    follower_count_status: followerSnapshot?.follower_count_status || latestSnapshot?.follower_count_status || "not_public",
     video_count: totals.video_count || 0,
     like_total: totals.like_total || 0,
     comment_total: totals.comment_total || 0,
@@ -706,6 +969,7 @@ export function computeWeeklySummaries(date = new Date()) {
       .prepare(
         `
         SELECT
+          COUNT(newest.id) AS video_snapshot_count,
           SUM(CASE WHEN newest.like_count IS NOT NULL AND oldest.like_count IS NOT NULL THEN newest.like_count - oldest.like_count ELSE 0 END) AS like_delta,
           SUM(CASE WHEN newest.comment_count IS NOT NULL AND oldest.comment_count IS NOT NULL THEN newest.comment_count - oldest.comment_count ELSE 0 END) AS comment_delta,
           SUM(CASE WHEN newest.favorite_count IS NOT NULL AND oldest.favorite_count IS NOT NULL THEN newest.favorite_count - oldest.favorite_count ELSE 0 END) AS favorite_delta
@@ -724,8 +988,17 @@ export function computeWeeklySummaries(date = new Date()) {
         )
         WHERE v.account_id = ?
       `
-      )
+    )
       .get(weekStart, weekEnd, weekStart, weekEnd, account.id);
+
+    if (snapshots.length === 0 && !videoDelta.video_snapshot_count) {
+      db.prepare("DELETE FROM weekly_summaries WHERE account_id = ? AND week_start = ? AND week_end = ?").run(
+        account.id,
+        weekStart,
+        weekEnd
+      );
+      continue;
+    }
 
     db.prepare(
       `
@@ -877,6 +1150,7 @@ export function listWeeklySummaries(limit = 80) {
       JOIN platforms p ON p.id = a.platform_id
       LEFT JOIN weekly_summaries prev ON prev.account_id = ws.account_id
         AND date(prev.week_start) = date(ws.week_start, '-7 days')
+      WHERE a.is_active = 1
       ORDER BY ws.week_start DESC, ws.updated_at DESC
       LIMIT ?
     `
@@ -891,9 +1165,9 @@ export function getOverview() {
     .prepare(
       `
       SELECT
-        COUNT(*) AS account_count,
+        SUM(CASE WHEN is_active = 1 THEN 1 ELSE 0 END) AS account_count,
         SUM(CASE WHEN is_active = 1 THEN 1 ELSE 0 END) AS active_count,
-        SUM(CASE WHEN latest_collect_status = 'failed' THEN 1 ELSE 0 END) AS failed_count
+        SUM(CASE WHEN is_active = 1 AND latest_collect_status = 'failed' THEN 1 ELSE 0 END) AS failed_count
       FROM accounts
     `
     )
@@ -918,6 +1192,7 @@ export function getOverview() {
       FROM weekly_summaries ws
       JOIN accounts a ON a.id = ws.account_id
       JOIN platforms p ON p.id = a.platform_id
+      WHERE a.is_active = 1
       ORDER BY COALESCE(ws.follower_delta, -999999999) DESC
       LIMIT 5
     `

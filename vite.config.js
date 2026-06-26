@@ -1,13 +1,12 @@
-import react from "@vitejs/plugin-react";
 import { defineConfig } from "vite";
 
 export default defineConfig({
-  plugins: [react()],
   server: {
-    host: "0.0.0.0",
-    port: 3000,
+    host: process.env.FRONTEND_HOST || "0.0.0.0",
+    port: Number(process.env.FRONTEND_PORT || 3102),
+    strictPort: true,
     proxy: {
-      "/api": "http://127.0.0.1:3001"
+      "/api": process.env.VITE_API_BASE_URL || `http://127.0.0.1:${process.env.BACKEND_PORT || 8102}`
     }
   },
   build: {

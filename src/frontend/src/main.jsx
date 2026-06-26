@@ -1,10 +1,21 @@
 import React, { useEffect, useMemo, useState } from "react";
 import { createRoot } from "react-dom/client";
 import {
+  CategoryScale,
+  Chart as ChartJS,
+  Legend,
+  LinearScale,
+  LineElement,
+  PointElement,
+  Tooltip
+} from "chart.js";
+import { Line } from "react-chartjs-2";
+import {
   Activity,
   AlertTriangle,
   BarChart3,
   CalendarClock,
+  CircleAlert,
   Database,
   Download,
   FileClock,
@@ -14,10 +25,14 @@ import {
   RefreshCw,
   Settings,
   ShieldCheck,
+  Trash2,
+  TrendingUp,
   Users
 } from "lucide-react";
 import { api } from "./api/client.js";
 import "./styles.css";
+
+ChartJS.register(CategoryScale, LinearScale, PointElement, LineElement, Tooltip, Legend);
 
 const navItems = [
   { key: "overview", label: "概览", icon: BarChart3 },
@@ -51,10 +66,12 @@ const statusLabels = {
 function App() {
   const [active, setActive] = useState("overview");
   const [accounts, setAccounts] = useState([]);
+  const [accountDashboardRows, setAccountDashboardRows] = useState([]);
   const [overview, setOverview] = useState(null);
   const [jobs, setJobs] = useState([]);
   const [videos, setVideos] = useState([]);
   const [hotVideos, setHotVideos] = useState([]);
+  const [topLikedVideos, setTopLikedVideos] = useState([]);
   const [dailyChanges, setDailyChanges] = useState([]);
   const [weekly, setWeekly] = useState([]);
   const [health, setHealth] = useState(null);
@@ -66,27 +83,35 @@ function App() {
   const [dailyFilters, setDailyFilters] = useState({ account_id: "", limit: "120" });
 
   const resolvedVideoFilters = useMemo(() => resolveVideoFilters(videoFilters), [videoFilters]);
+  const latestDataTime = useMemo(
+    () => getLatestDataTime([...jobs, ...accountDashboardRows, ...topLikedVideos, ...dailyChanges]),
+    [jobs, accountDashboardRows, topLikedVideos, dailyChanges]
+  );
 
   async function refresh(videoQuery = resolvedVideoFilters, dailyQuery = dailyFilters) {
     setLoading(true);
     setError("");
     try {
-      const [healthData, overviewData, accountsData, jobsData, videosData, hotData, dailyData, weeklyData] = await Promise.all([
+      const [healthData, overviewData, accountsData, accountRowsData, jobsData, videosData, hotData, topLikedData, dailyData, weeklyData] = await Promise.all([
         api.health(),
         api.overview(),
         api.accounts(),
+        api.accountDashboardRows(),
         api.jobs(),
         api.videos(videoQuery),
         api.hotVideos(),
+        api.topLikedVideos({ limit: 5 }),
         api.dailyChanges(dailyQuery),
         api.weekly()
       ]);
       setHealth(healthData);
       setOverview(overviewData);
       setAccounts(accountsData);
+      setAccountDashboardRows(accountRowsData);
       setJobs(jobsData);
       setVideos(videosData);
       setHotVideos(hotData);
+      setTopLikedVideos(topLikedData);
       setDailyChanges(dailyData);
       setWeekly(weeklyData);
     } catch (err) {
@@ -149,6 +174,34 @@ function App() {
     }
   }
 
+  async function handleDeleteAccount(account) {
+    const confirmed = window.confirm(`确认删除「${account.display_name}」吗？删除后该账号不再自动采集，历史数据会保留。`);
+    if (!confirmed) return;
+
+    setError("");
+    try {
+      await api.deleteAccount(account.id);
+      await refresh(resolvedVideoFilters, dailyFilters);
+    } catch (err) {
+      setError(err.message);
+    }
+  }
+
+  async function handleClearAccountData(account) {
+    const confirmed = window.confirm(
+      `确认清空「${account.display_name}」的历史采集数据吗？账号不会删除，自动采集设置会保留，清空后需要重新采集才会产生新数据。`
+    );
+    if (!confirmed) return;
+
+    setError("");
+    try {
+      await api.clearAccountData(account.id);
+      await refresh(resolvedVideoFilters, dailyFilters);
+    } catch (err) {
+      setError(err.message);
+    }
+  }
+
   const stats = useMemo(() => {
     const totals = overview?.totals || {};
     const jobStats = overview?.jobs || {};
@@ -163,11 +216,11 @@ function App() {
     );
 
     return [
-      { label: "观察账号", value: totals.active_count || 0, hint: `总计 ${totals.account_count || 0}` },
-      { label: "本周采集", value: jobStats.total || 0, hint: `${jobStats.success || 0} 成功` },
-      { label: "采集失败", value: totals.failed_count || 0, hint: "需人工查看" },
-      { label: "粉丝新增", value: formatNumber(weeklyTotals.followers), hint: "本周汇总" },
-      { label: "互动新增", value: formatNumber(weeklyTotals.interactions), hint: "赞评藏合计" }
+      { label: "观察账号", value: totals.active_count || 0, hint: `总计 ${totals.account_count || 0}`, icon: Users },
+      { label: "本周采集", value: jobStats.total || 0, hint: `${jobStats.success || 0} 成功`, icon: Database },
+      { label: "采集失败", value: totals.failed_count || 0, hint: "需人工查看", icon: CircleAlert },
+      { label: "粉丝新增", value: formatNumber(weeklyTotals.followers), hint: "本周汇总", icon: TrendingUp },
+      { label: "互动新增", value: formatNumber(weeklyTotals.interactions), hint: "赞评藏合计", icon: Activity }
     ];
   }, [overview, weekly]);
 
@@ -175,10 +228,10 @@ function App() {
     <div className="app-shell">
       <aside className="sidebar">
         <div className="brand">
-          <div className="brand-mark">数</div>
-          <div>
-            <strong>对标监控</strong>
-            <span>公开数据采集</span>
+          <BrandMark />
+          <div className="brand-copy">
+            <strong>润美居空间设计</strong>
+            <span>对标账号监控</span>
           </div>
         </div>
         <nav>
@@ -198,7 +251,10 @@ function App() {
         </nav>
         <div className="compliance-note">
           <ShieldCheck size={18} />
-          <span>只采集公开可见数据；遇到登录、验证码或权限限制即停止。</span>
+          <div>
+            <strong>数据合规采集</strong>
+            <span>只采集公开可见数据；遇到登录、验证码或权限限制即停止。</span>
+          </div>
         </div>
       </aside>
 
@@ -209,6 +265,10 @@ function App() {
             <p>定时采集抖音、视频号公开指标，按天和按周查看变化。</p>
           </div>
           <div className="topbar-actions">
+            <div className="topbar-meta" title="数据更新时间来自最近采集、账号或视频记录">
+              <span>{formatShortDate(new Date())}</span>
+              <em>更新 {formatDate(latestDataTime)}</em>
+            </div>
             <button className="ghost-button" onClick={() => refresh(resolvedVideoFilters, dailyFilters)} disabled={loading}>
               <RefreshCw size={16} />
               刷新
@@ -227,22 +287,39 @@ function App() {
           </div>
         )}
 
-        <section className="stats-grid">
-          {stats.map((stat) => (
+        <section className="stats-grid" aria-label="数据概览">
+          {stats.map((stat) => {
+            const Icon = stat.icon;
+            return (
             <div className="stat-card" key={stat.label}>
-              <span>{stat.label}</span>
-              <strong>{stat.value}</strong>
-              <em>{stat.hint}</em>
+              <div className="stat-icon"><Icon size={20} /></div>
+              <div className="stat-content">
+                <span>{stat.label}</span>
+                <strong>{stat.value}</strong>
+                <em>{stat.hint}</em>
+              </div>
             </div>
-          ))}
+            );
+          })}
         </section>
 
-        {active === "overview" && <Overview accounts={accounts} jobs={jobs} weekly={weekly} onGo={setActive} />}
+        {active === "overview" && (
+          <Overview
+            accounts={accountDashboardRows}
+            jobs={jobs}
+            dailyChanges={dailyChanges}
+            topLikedVideos={topLikedVideos}
+            health={health}
+            onGo={setActive}
+          />
+        )}
         {active === "accounts" && (
           <Accounts
             accounts={accounts}
             onCapture={handleCapture}
             onUpdate={handleUpdateAccount}
+            onDelete={handleDeleteAccount}
+            onClearData={handleClearAccountData}
             captureId={captureId}
           />
         )}
@@ -265,7 +342,7 @@ function App() {
         )}
         {active === "hot" && <HotVideos videos={hotVideos} />}
         {active === "jobs" && <Jobs jobs={jobs} />}
-        {active === "weekly" && <Weekly weekly={weekly} />}
+        {active === "weekly" && <Weekly weekly={weekly} accounts={accounts} />}
         {active === "settings" && <SettingsPanel health={health} />}
       </main>
 
@@ -274,69 +351,222 @@ function App() {
   );
 }
 
-function Overview({ accounts, jobs, weekly, onGo }) {
-  const latestSuccess = jobs.find((job) => job.status === "success");
-  const failedJobs = jobs.filter((job) => job.status === "failed").slice(0, 5);
-  const topWeekly = [...weekly].sort((a, b) => totalInteractionDelta(b) - totalInteractionDelta(a)).slice(0, 5);
+function BrandMark() {
+  return (
+    <svg className="brand-mark" viewBox="0 0 52 52" role="img" aria-label="润美居空间设计标志">
+      <path className="brand-frame" d="M9 43V16L19 7h20v20" />
+      <path className="brand-door" d="M20 43V8" />
+      <path className="brand-chart" d="m17 37 8-8 6 5 12-13" />
+      <path className="brand-arrow" d="M37 21h6v6" />
+      <path className="brand-base" d="M8 44h32" />
+    </svg>
+  );
+}
+
+function Overview({ accounts, jobs, dailyChanges, topLikedVideos, health, onGo }) {
+  const [trendAccountId, setTrendAccountId] = useState("");
+  const trendRows = useMemo(() => buildSevenDayTrend(dailyChanges, trendAccountId), [dailyChanges, trendAccountId]);
+  const systemItems = useMemo(() => buildSystemItems({ health, jobs, accounts, dailyChanges, topLikedVideos }), [health, jobs, accounts, dailyChanges, topLikedVideos]);
+  const trendAccount = accounts.find((account) => String(account.id) === String(trendAccountId));
 
   return (
-    <div className="dashboard-grid">
-      <section className="panel wide">
-        <PanelHeader title="今日看板" icon={Activity} />
-        <div className="insight-grid">
-          <InsightCard label="最近成功采集" value={latestSuccess?.display_name || "-"} hint={formatDate(latestSuccess?.finished_at)} />
-          <InsightCard label="待关注失败" value={failedJobs.length} hint={failedJobs.length ? "采集任务页查看原因" : "暂无失败任务"} />
-          <InsightCard label="账号数量" value={accounts.length} hint="在对标账号页维护账号" />
-        </div>
-        <div className="panel-actions">
-          <button className="small-button" onClick={() => onGo("videos")}>查看视频数据</button>
-          <button className="small-button" onClick={() => onGo("daily")}>查看每日变化</button>
-          <button className="small-button" onClick={() => onGo("accounts")}>管理账号</button>
-        </div>
-      </section>
-      <section className="panel">
-        <PanelHeader title="最近采集日志" icon={FileClock} />
-        <div className="timeline">
-          {jobs.slice(0, 8).map((job) => (
-            <div className="timeline-item" key={job.id}>
-              <StatusDot status={job.status} />
-              <div>
-                <strong>{job.display_name}</strong>
-                <span>{statusLabels[job.status] || job.status} · {formatDate(job.finished_at || job.created_at)}</span>
-              </div>
+    <div className="overview-layout">
+      <div className="overview-main-column">
+        <section className="panel dashboard-account-panel">
+          <PanelHeader title="对标账号监控" icon={Users} action={<button className="primary-button compact" onClick={() => onGo("accounts")}><Plus size={14} />添加账号</button>} />
+          <DashboardAccountTable accounts={accounts} onGo={onGo} />
+        </section>
+
+        <section className="panel trend-panel">
+          <PanelHeader title="周度数据趋势（最近 7 天）" icon={TrendingUp} />
+          <div className="trend-filter-row">
+            <div className="inline-select-control">
+              <AccountFilter accounts={accounts} value={trendAccountId} onChange={setTrendAccountId} />
             </div>
-          ))}
-          {jobs.length === 0 && <Empty text="暂无采集任务" />}
-        </div>
-      </section>
-      <section className="panel wide">
-        <PanelHeader title="本周互动增量排行" icon={CalendarClock} />
-        <WeeklyTable weekly={topWeekly} compact />
-      </section>
+            <span className="filter-summary">
+              {trendAccount ? `正在查看：${trendAccount.display_name}` : `全部账号汇总：${accounts.length} 个`}
+            </span>
+          </div>
+          <TrendChart rows={trendRows} />
+        </section>
+      </div>
+
+      <aside className="overview-side-column">
+        <section className="panel compact-panel">
+          <PanelHeader title="最近采集活动" icon={FileClock} action={<button className="link-button" onClick={() => onGo("jobs")}>查看全部</button>} />
+          <CaptureActivityList jobs={jobs} />
+        </section>
+
+        <section className="panel compact-panel">
+          <PanelHeader title="系统状态" icon={ShieldCheck} />
+          <SystemStatusGrid items={systemItems} />
+        </section>
+
+        <section className="panel compact-panel">
+          <PanelHeader title="爆款视频 TOP5" icon={Activity} action={<button className="link-button" onClick={() => onGo("videos")}>查看全部</button>} />
+          <TopLikedVideoTable videos={topLikedVideos} />
+        </section>
+      </aside>
     </div>
   );
 }
 
-function InsightCard({ label, value, hint }) {
+function DashboardAccountTable({ accounts, onGo }) {
   return (
-    <div className="insight-card">
-      <span>{label}</span>
-      <strong>{value}</strong>
-      <em>{hint || "-"}</em>
+    <div className="table-wrap dashboard-table-wrap">
+      <table className="dashboard-account-table">
+        <thead>
+          <tr>
+            <th>账号信息</th>
+            <th>平台</th>
+            <th>粉丝数</th>
+            <th>视频数</th>
+            <th>近 7 日作品</th>
+            <th>自动频率</th>
+            <th>状态</th>
+            <th>最近采集</th>
+            <th>操作</th>
+          </tr>
+        </thead>
+        <tbody>
+          {accounts.slice(0, 8).map((account) => (
+            <tr key={account.id}>
+              <td>
+                <div className="cell-title">
+                  <strong>{account.display_name}</strong>
+                  <span>{account.category || "未分类"}</span>
+                </div>
+              </td>
+              <td><Badge>{account.platform_name}</Badge></td>
+              <td>{formatMetric(account.latest_follower_count, account.latest_follower_count == null ? "平台未公开" : "--")}</td>
+              <td>{formatNumber(account.video_count || 0)}</td>
+              <td>{formatNumber(account.recent_video_count || 0)}</td>
+              <td>{frequencyLabels[account.capture_frequency] || account.capture_frequency}</td>
+              <td><StatusPill status={account.latest_collect_status} /></td>
+              <td>{formatDate(account.last_captured_at)}</td>
+              <td><button className="link-button" onClick={() => onGo("accounts")}>查看</button></td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+      {accounts.length === 0 && <Empty text="暂无观察账号，请先新增对标账号。" />}
     </div>
   );
 }
 
-function Accounts({ accounts, onCapture, onUpdate, captureId }) {
+function CaptureActivityList({ jobs }) {
+  return (
+    <div className="timeline compact-timeline">
+      {jobs.slice(0, 5).map((job) => (
+        <div className="timeline-item" key={job.id}>
+          <StatusDot status={job.status} />
+          <div>
+            <strong>{job.display_name}</strong>
+            <span>{statusLabels[job.status] || job.status} · {formatDate(job.finished_at || job.started_at || job.created_at)}</span>
+          </div>
+        </div>
+      ))}
+      {jobs.length === 0 && <Empty text="暂无采集任务" />}
+    </div>
+  );
+}
+
+function SystemStatusGrid({ items }) {
+  return (
+    <div className="system-status-grid">
+      {items.map((item) => {
+        const Icon = item.icon;
+        return (
+          <div className="system-status-item" key={item.label}>
+            <Icon size={18} />
+            <span>{item.label}</span>
+            <strong className={item.tone || "ok"}>{item.value}</strong>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+function TopLikedVideoTable({ videos }) {
+  return (
+    <div className="top-video-list">
+      {videos.slice(0, 5).map((video) => (
+        <div className="top-video-row" key={video.id}>
+          <a className="compact-title" href={video.video_url} target="_blank" rel="noreferrer" title={video.title || video.video_url}>
+            {video.title || "未命名视频"}
+          </a>
+          <span className="top-video-account">{video.account_name}</span>
+          <div className="top-video-metrics">
+            <span>赞 {formatMetric(video.like_count)}</span>
+            <span>评 {formatMetric(video.comment_count)}</span>
+            <span>藏 {formatMetric(video.favorite_count)}</span>
+          </div>
+        </div>
+      ))}
+      {videos.length === 0 && <Empty text="暂无可排行视频数据。" />}
+    </div>
+  );
+}
+
+function TrendChart({ rows }) {
+  const data = {
+    labels: rows.map((row) => row.label),
+    datasets: [
+      {
+        label: "粉丝变化",
+        data: rows.map((row) => row.followers),
+        borderColor: "#0f7a5d",
+        backgroundColor: "#0f7a5d",
+        tension: 0.28
+      },
+      {
+        label: "点赞变化",
+        data: rows.map((row) => row.likes),
+        borderColor: "#c99252",
+        backgroundColor: "#c99252",
+        tension: 0.28
+      },
+      {
+        label: "互动变化",
+        data: rows.map((row) => row.interactions),
+        borderColor: "#66736e",
+        backgroundColor: "#66736e",
+        tension: 0.28
+      }
+    ]
+  };
+  const options = {
+    responsive: true,
+    maintainAspectRatio: false,
+    plugins: {
+      legend: { position: "top", align: "start", labels: { boxWidth: 20, usePointStyle: true } },
+      tooltip: { mode: "index", intersect: false }
+    },
+    scales: {
+      x: { grid: { display: false } },
+      y: { beginAtZero: true, ticks: { precision: 0 } }
+    },
+    elements: { point: { radius: 3, hoverRadius: 5 }, line: { borderWidth: 2 } }
+  };
+
+  return (
+    <div className="trend-chart-box">
+      <Line data={data} options={options} />
+    </div>
+  );
+}
+
+function Accounts({ accounts, onCapture, onUpdate, onDelete, onClearData, captureId }) {
   return (
     <section className="panel">
       <PanelHeader title="对标账号管理" icon={Users} />
-      <AccountTable accounts={accounts} onCapture={onCapture} onUpdate={onUpdate} captureId={captureId} />
+      <AccountTable accounts={accounts} onCapture={onCapture} onUpdate={onUpdate} onDelete={onDelete} onClearData={onClearData} captureId={captureId} />
     </section>
   );
 }
 
-function AccountTable({ accounts, onCapture, onUpdate, captureId }) {
+function AccountTable({ accounts, onCapture, onUpdate, onDelete, onClearData, captureId }) {
   return (
     <div className="table-wrap">
       <table>
@@ -346,6 +576,7 @@ function AccountTable({ accounts, onCapture, onUpdate, captureId }) {
             <th>平台</th>
             <th>自动频率</th>
             <th>更新时间</th>
+            <th>更新条数</th>
             <th>点赞预警</th>
             <th>最新粉丝</th>
             <th>状态</th>
@@ -383,6 +614,17 @@ function AccountTable({ accounts, onCapture, onUpdate, captureId }) {
               </td>
               <td>
                 <input
+                  className="table-control compact-number"
+                  type="number"
+                  min="1"
+                  max="100"
+                  step="1"
+                  value={account.capture_video_limit || 10}
+                  onChange={(event) => onUpdate(account.id, { capture_video_limit: event.target.value })}
+                />
+              </td>
+              <td>
+                <input
                   className="table-control"
                   type="number"
                   min="0"
@@ -395,10 +637,30 @@ function AccountTable({ accounts, onCapture, onUpdate, captureId }) {
               <td><StatusPill status={account.latest_collect_status} /></td>
               <td>{formatDate(account.last_captured_at)}</td>
               <td>
-                <button className="small-button" onClick={() => onCapture(account.id)} disabled={captureId === account.id}>
-                  <RefreshCw size={14} />
-                  {captureId === account.id ? "采集中" : "立即更新"}
-                </button>
+                <div className="row-actions">
+                  <button className="small-button" onClick={() => onCapture(account.id)} disabled={captureId === account.id}>
+                    <RefreshCw size={14} />
+                    {captureId === account.id ? "采集中" : "立即更新"}
+                  </button>
+                  <button
+                    className="small-button warning-button"
+                    onClick={() => onClearData(account)}
+                    title="清空历史采集数据，保留账号和采集设置"
+                    aria-label={`清空账号 ${account.display_name} 的历史采集数据`}
+                  >
+                    <Database size={14} />
+                    清空数据
+                  </button>
+                  <button
+                    className="small-button danger-button"
+                    onClick={() => onDelete(account)}
+                    title="删除账号"
+                    aria-label={`删除账号 ${account.display_name}`}
+                  >
+                    <Trash2 size={14} />
+                    删除
+                  </button>
+                </div>
               </td>
             </tr>
           ))}
@@ -471,7 +733,7 @@ function Videos({ videos, accounts, filters, resolvedFilters, onApplyFilters }) 
 function VideoTable({ videos }) {
   return (
     <div className="table-wrap">
-      <table>
+      <table className="video-data-table">
         <thead>
           <tr>
             <th>发布时间</th>
@@ -487,7 +749,11 @@ function VideoTable({ videos }) {
           {videos.map((video) => (
             <tr key={video.id}>
               <td>{formatDate(video.published_at)}</td>
-              <td><a href={video.video_url} target="_blank" rel="noreferrer">{video.title || video.video_url}</a></td>
+              <td className="video-title-cell">
+                <a className="video-title-link" title={video.title || video.video_url} href={video.video_url} target="_blank" rel="noreferrer">
+                  {video.title || video.video_url}
+                </a>
+              </td>
               <td>{video.account_name}</td>
               <td>{metricCell(video.like_count, video.like_count_status)}</td>
               <td>{metricCell(video.comment_count, video.comment_count_status)}</td>
@@ -652,11 +918,24 @@ function Jobs({ jobs }) {
   );
 }
 
-function Weekly({ weekly }) {
+function Weekly({ weekly, accounts }) {
+  const [accountId, setAccountId] = useState("");
+  const visibleWeekly = useMemo(
+    () => (accountId ? weekly.filter((item) => String(item.account_id) === String(accountId)) : weekly),
+    [weekly, accountId]
+  );
+  const selectedAccount = accounts.find((account) => String(account.id) === String(accountId));
+
   return (
     <section className="panel">
       <PanelHeader title="周汇总：本周 vs 上周" icon={CalendarClock} />
-      <WeeklyTable weekly={weekly} />
+      <div className="filter-bar">
+        <AccountFilter accounts={accounts} value={accountId} onChange={setAccountId} />
+        <div className="filter-summary">
+          {selectedAccount ? `正在查看：${selectedAccount.display_name}` : `全部账号：${accounts.length} 个`}
+        </div>
+      </div>
+      <WeeklyTable weekly={visibleWeekly} />
     </section>
   );
 }
@@ -748,6 +1027,7 @@ function AccountForm({ onClose, onSubmit }) {
           </select>
         </label>
         <label>每天/每周更新时间<input name="preferred_capture_time" type="time" defaultValue="09:00" /></label>
+        <label>每次更新视频条数<input name="capture_video_limit" type="number" min="1" max="100" step="1" defaultValue="10" /></label>
         <label>点赞预警线<input name="like_alert_threshold" type="number" min="0" step="1" defaultValue="0" placeholder="例如：1000" /></label>
         <label>分类<input name="category" placeholder="同行 / 达人 / 品牌号" /></label>
         <label>标签<input name="tags" placeholder="短视频 本地生活" /></label>
@@ -787,10 +1067,11 @@ function FrequencyOptions() {
   );
 }
 
-function PanelHeader({ title, icon: Icon }) {
+function PanelHeader({ title, icon: Icon, action }) {
   return (
     <div className="panel-header">
       <div><Icon size={18} /><h2>{title}</h2></div>
+      {action}
     </div>
   );
 }
@@ -820,6 +1101,79 @@ function metricCell(value, status) {
   if (status === "not_public") return "平台未公开";
   if (status === "failed") return "采集失败";
   return formatNullable(value);
+}
+
+function formatMetric(value, fallback = "--") {
+  return value == null ? fallback : formatNumber(value);
+}
+
+function buildSevenDayTrend(rows, accountId = "") {
+  const today = new Date();
+  const days = Array.from({ length: 7 }, (_, index) => {
+    const date = new Date(today);
+    date.setDate(today.getDate() - (6 - index));
+    return dateKey(date);
+  });
+
+  return days.map((day) => {
+    const dayRows = rows.filter(
+      (row) => row.day === day && (!accountId || String(row.account_id) === String(accountId))
+    );
+    return {
+      day,
+      label: day.slice(5),
+      followers: aggregateDelta(dayRows, "follower_delta"),
+      likes: aggregateDelta(dayRows, "like_delta"),
+      interactions: aggregateInteractionDelta(dayRows)
+    };
+  });
+}
+
+function aggregateDelta(rows, key) {
+  if (rows.length === 0) return 0;
+  const values = rows.map((row) => row[key]).filter((value) => value != null);
+  if (values.length === 0) return null;
+  return values.reduce((sum, value) => sum + value, 0);
+}
+
+function aggregateInteractionDelta(rows) {
+  if (rows.length === 0) return 0;
+  const values = rows.map((row) => {
+    const parts = [row.comment_delta, row.favorite_delta].filter((value) => value != null);
+    return parts.length ? parts.reduce((sum, value) => sum + value, 0) : null;
+  }).filter((value) => value != null);
+  if (values.length === 0) return null;
+  return values.reduce((sum, value) => sum + value, 0);
+}
+
+function buildSystemItems({ health, jobs, accounts, dailyChanges, topLikedVideos }) {
+  const pendingCount = jobs.filter((job) => job.status === "pending").length;
+  const runningCount = jobs.filter((job) => job.status === "running").length;
+  const latestTime = getLatestDataTime([...jobs, ...accounts, ...dailyChanges, ...topLikedVideos]);
+
+  return [
+    { label: "API 服务", value: health?.ok ? "正常" : "异常", tone: health?.ok ? "ok" : "bad", icon: ShieldCheck },
+    { label: "数据更新时间", value: formatDate(latestTime), tone: latestTime ? "ok" : "warn", icon: Database },
+    { label: "待处理任务", value: `${pendingCount} 个`, tone: pendingCount ? "warn" : "ok", icon: FileClock },
+    { label: "当前采集", value: runningCount ? "执行中" : "空闲", tone: runningCount ? "warn" : "ok", icon: Activity }
+  ];
+}
+
+function getLatestDataTime(items) {
+  const fields = ["finished_at", "started_at", "last_captured_at", "captured_at", "updated_at", "created_at"];
+  const times = items.flatMap((item) => fields.map((field) => item?.[field]).filter(Boolean))
+    .map((value) => new Date(value).getTime())
+    .filter((value) => Number.isFinite(value));
+  if (times.length === 0) return null;
+  return new Date(Math.max(...times)).toISOString();
+}
+
+function dateKey(value) {
+  const date = new Date(value);
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, "0");
+  const day = String(date.getDate()).padStart(2, "0");
+  return `${year}-${month}-${day}`;
 }
 
 function explainJob(job) {
