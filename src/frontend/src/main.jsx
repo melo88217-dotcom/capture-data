@@ -205,15 +205,7 @@ function App() {
   const stats = useMemo(() => {
     const totals = overview?.totals || {};
     const jobStats = overview?.jobs || {};
-    const weeklyTotals = weekly.reduce(
-      (acc, item) => {
-        acc.followers += item.follower_delta || 0;
-        acc.interactions +=
-          (item.video_like_delta || 0) + (item.video_comment_delta || 0) + (item.video_favorite_delta || 0);
-        return acc;
-      },
-      { followers: 0, interactions: 0 }
-    );
+    const weeklyTotals = overview?.weeklyTotals || { followers: 0, interactions: 0 };
 
     return [
       { label: "观察账号", value: totals.active_count || 0, hint: `总计 ${totals.account_count || 0}`, icon: Users },
@@ -222,7 +214,7 @@ function App() {
       { label: "粉丝新增", value: formatNumber(weeklyTotals.followers), hint: "本周汇总", icon: TrendingUp },
       { label: "互动新增", value: formatNumber(weeklyTotals.interactions), hint: "赞评藏合计", icon: Activity }
     ];
-  }, [overview, weekly]);
+  }, [overview]);
 
   return (
     <div className="app-shell">

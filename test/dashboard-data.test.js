@@ -16,12 +16,50 @@ const {
   listAccountDashboardRows,
   listDailyChanges,
   listHotVideos,
+  getOverview,
   listVideos,
   listWeeklySummaries,
   listTopLikedVideos
 } = await import("../src/backend/services/repository.js");
 
 initDatabase();
+
+test("overview totals include only the current week's summaries", () => {
+  const account = createAccount({
+    platform: "douyin",
+    display_name: "current-week-overview",
+    profile_url: `https://example.com/current-week-overview-${process.pid}`,
+    capture_frequency: "daily"
+  });
+  const now = new Date();
+  const day = now.getDay() || 7;
+  const currentWeekStart = new Date(now);
+  currentWeekStart.setHours(0, 0, 0, 0);
+  currentWeekStart.setDate(now.getDate() - day + 1);
+  const previousWeekStart = new Date(currentWeekStart);
+  previousWeekStart.setDate(previousWeekStart.getDate() - 7);
+
+  db.prepare(
+    `INSERT INTO weekly_summaries (
+      account_id, week_start, week_end, follower_delta, video_like_delta,
+      video_comment_delta, video_favorite_delta, data_status
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+  ).run(account.id, previousWeekStart.toISOString(), new Date(currentWeekStart.getTime() - 1).toISOString(), -488899, 1, 1, 1, "complete");
+
+  db.prepare(
+    `INSERT INTO account_snapshots (
+      account_id, captured_at, follower_count, follower_count_status, raw_follower_text, source_url
+    ) VALUES (?, ?, ?, 'available', ?, ?), (?, ?, ?, 'available', ?, ?)`
+  ).run(
+    account.id, new Date(currentWeekStart.getTime() + 3600000).toISOString(), 1000, "1000", account.profile_url,
+    account.id, new Date(currentWeekStart.getTime() + 7200000).toISOString(), 1154, "1154", account.profile_url
+  );
+
+  const overview = getOverview();
+
+  assert.equal(overview.weeklyTotals.followers, 154);
+  assert.equal(overview.weeklyTotals.interactions, 0);
+});
 
 function addVideo(accountId, url, title, publishedAt, likeCount, commentCount = 0, favoriteCount = 0) {
   const info = db.prepare(
@@ -154,6 +192,57 @@ test("daily changes keep same-day available follower snapshot when later capture
   assert.equal(rows[0].captured_at, "2026-06-25T03:00:00.000Z");
   assert.equal(rows[0].follower_count, 1000);
   assert.equal(rows[0].follower_count_status, "available");
+});
+
+test("daily changes do not treat failed video metric snapshots as zero", () => {
+  const account = createAccount({
+    platform: "douyin",
+    display_name: "daily-video-failed-not-zero",
+    profile_url: `https://example.com/daily-video-failed-not-zero-${process.pid}`,
+    capture_frequency: "daily"
+  });
+
+  const video = db.prepare(
+    `INSERT INTO videos (account_id, video_url, title, published_at) VALUES (?, ?, ?, ?)`
+  ).run(account.id, `https://example.com/v/failed-not-zero-${process.pid}`, "failed metric video", "2026-07-01T00:00:00.000Z").lastInsertRowid;
+
+  db.prepare(
+    `INSERT INTO account_snapshots (
+      account_id, captured_at, follower_count, follower_count_status, raw_follower_text, source_url
+    ) VALUES (?, ?, ?, 'available', ?, ?), (?, ?, ?, 'available', ?, ?), (?, ?, ?, 'available', ?, ?)`
+  ).run(
+    account.id, "2026-07-05T01:00:00.000Z", 1000, "1000", account.profile_url,
+    account.id, "2026-07-06T01:00:00.000Z", 1001, "1001", account.profile_url,
+    account.id, "2026-07-08T01:00:00.000Z", 1002, "1002", account.profile_url
+  );
+  db.prepare(
+    `INSERT INTO video_snapshots (
+      video_id, captured_at, like_count, comment_count, favorite_count,
+      like_count_status, comment_count_status, favorite_count_status, raw_metric_text
+    ) VALUES
+      (?, ?, 200, 20, 10, 'available', 'available', 'available', ''),
+      (?, ?, NULL, NULL, NULL, 'failed', 'failed', 'failed', '页面要求登录后查看。'),
+      (?, ?, 220, 22, 11, 'available', 'available', 'available', '')`
+  ).run(
+    video, "2026-07-05T01:00:00.000Z",
+    video, "2026-07-06T01:00:00.000Z",
+    video, "2026-07-08T01:00:00.000Z"
+  );
+
+  const rows = listDailyChanges({ account_id: account.id, limit: "10" });
+  const failedDay = rows.find((row) => row.day === "2026-07-06");
+  const recoveredDay = rows.find((row) => row.day === "2026-07-08");
+
+  assert.equal(failedDay.like_total, null);
+  assert.equal(failedDay.comment_total, null);
+  assert.equal(failedDay.favorite_total, null);
+  assert.equal(failedDay.like_delta, null);
+  assert.equal(failedDay.comment_delta, null);
+  assert.equal(failedDay.favorite_delta, null);
+  assert.equal(recoveredDay.like_total, 220);
+  assert.equal(recoveredDay.like_delta, null);
+  assert.equal(recoveredDay.comment_delta, null);
+  assert.equal(recoveredDay.favorite_delta, null);
 });
 
 test("clearing account capture data keeps account settings and removes historical rows", () => {

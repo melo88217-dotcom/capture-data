@@ -75,8 +75,19 @@ export async function collectPublicPage(account, options = {}) {
         video.comment_count_status === "available" ||
         video.favorite_count_status === "available"
     );
+    const hasFailedVideoMetric = videos.some(
+      (video) =>
+        video.like_count_status === "failed" ||
+        video.comment_count_status === "failed" ||
+        video.favorite_count_status === "failed"
+    );
     const hasOnlyLinks = videos.length > 0 && !hasFollower && !hasVideoMetric;
-    const status = hasFollower || hasVideoMetric ? "success" : hasOnlyLinks ? "partial_success" : "failed";
+    const status =
+      hasVideoMetric || (hasFollower && videos.length === 0)
+        ? "success"
+        : hasFollower || hasOnlyLinks || hasFailedVideoMetric
+          ? "partial_success"
+          : "failed";
     const warningMessage =
       status === "success" && hasVideoMetric && !hasFollower ? messages.followerMissing : null;
 

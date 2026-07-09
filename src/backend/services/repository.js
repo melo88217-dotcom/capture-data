@@ -817,9 +817,18 @@ function buildDailyRow(account, day) {
       `
       SELECT
         COUNT(DISTINCT v.id) AS video_count,
-        SUM(CASE WHEN latest.like_count IS NOT NULL THEN latest.like_count ELSE 0 END) AS like_total,
-        SUM(CASE WHEN latest.comment_count IS NOT NULL THEN latest.comment_count ELSE 0 END) AS comment_total,
-        SUM(CASE WHEN latest.favorite_count IS NOT NULL THEN latest.favorite_count ELSE 0 END) AS favorite_total
+        CASE
+          WHEN SUM(CASE WHEN latest.like_count_status = 'failed' THEN 1 ELSE 0 END) > 0 THEN NULL
+          ELSE SUM(CASE WHEN latest.like_count IS NOT NULL THEN latest.like_count ELSE 0 END)
+        END AS like_total,
+        CASE
+          WHEN SUM(CASE WHEN latest.comment_count_status = 'failed' THEN 1 ELSE 0 END) > 0 THEN NULL
+          ELSE SUM(CASE WHEN latest.comment_count IS NOT NULL THEN latest.comment_count ELSE 0 END)
+        END AS comment_total,
+        CASE
+          WHEN SUM(CASE WHEN latest.favorite_count_status = 'failed' THEN 1 ELSE 0 END) > 0 THEN NULL
+          ELSE SUM(CASE WHEN latest.favorite_count IS NOT NULL THEN latest.favorite_count ELSE 0 END)
+        END AS favorite_total
       FROM videos v
       LEFT JOIN video_snapshots latest ON latest.id = (
         SELECT id
@@ -837,6 +846,8 @@ function buildDailyRow(account, day) {
     )
     .get(day, account.id, day);
 
+  const videoCount = totals.video_count || 0;
+
   return {
     day,
     captured_at: latestSnapshot?.captured_at || getDailyVideoCapturedAt(account.id, day),
@@ -845,10 +856,10 @@ function buildDailyRow(account, day) {
     platform_name: account.platform_name,
     follower_count: followerSnapshot?.follower_count ?? null,
     follower_count_status: followerSnapshot?.follower_count_status || latestSnapshot?.follower_count_status || "not_public",
-    video_count: totals.video_count || 0,
-    like_total: totals.like_total || 0,
-    comment_total: totals.comment_total || 0,
-    favorite_total: totals.favorite_total || 0
+    video_count: videoCount,
+    like_total: videoCount === 0 ? 0 : totals.like_total,
+    comment_total: videoCount === 0 ? 0 : totals.comment_total,
+    favorite_total: videoCount === 0 ? 0 : totals.favorite_total
   };
 }
 
@@ -1160,6 +1171,7 @@ export function listWeeklySummaries(limit = 80) {
 
 export function getOverview() {
   computeWeeklySummaries();
+  const currentWeekStart = startOfWeek().toISOString();
 
   const totals = db
     .prepare(
@@ -1192,12 +1204,27 @@ export function getOverview() {
       FROM weekly_summaries ws
       JOIN accounts a ON a.id = ws.account_id
       JOIN platforms p ON p.id = a.platform_id
-      WHERE a.is_active = 1
+      WHERE a.is_active = 1 AND ws.week_start = ?
       ORDER BY COALESCE(ws.follower_delta, -999999999) DESC
       LIMIT 5
     `
     )
-    .all();
+    .all(currentWeekStart);
 
-  return { totals, jobs, topFollowers };
+  const weeklyTotals = db
+    .prepare(
+      `
+      SELECT
+        COALESCE(SUM(ws.follower_delta), 0) AS followers,
+        COALESCE(SUM(ws.video_like_delta), 0)
+          + COALESCE(SUM(ws.video_comment_delta), 0)
+          + COALESCE(SUM(ws.video_favorite_delta), 0) AS interactions
+      FROM weekly_summaries ws
+      JOIN accounts a ON a.id = ws.account_id
+      WHERE a.is_active = 1 AND ws.week_start = ?
+    `
+    )
+    .get(currentWeekStart);
+
+  return { totals, jobs, topFollowers, weeklyTotals };
 }
