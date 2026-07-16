@@ -18,6 +18,8 @@ async function request(path, options = {}) {
 
 export const api = {
   health: () => request("/health"),
+  browserCacheStatus: () => request("/browser-cache/status"),
+  cleanBrowserCache: () => request("/browser-cache/cleanup", { method: "POST" }),
   overview: () => request("/overview"),
   platforms: () => request("/platforms"),
   accounts: () => request("/accounts"),
@@ -41,7 +43,7 @@ export const api = {
   jobs: () => request("/jobs"),
   videos: (filters = {}) => request(withQuery("/videos", filters)),
   topLikedVideos: (filters = {}) => request(withQuery("/videos/top-liked", filters)),
-  hotVideos: () => request("/hot-videos"),
+  hotVideos: (filters = {}) => request(withQuery("/hot-videos", filters)),
   videoExportUrl: (filters = {}) => `/api${withQuery("/videos/export.csv", filters)}`,
   videoExcelExportUrl: (filters = {}) => `/api${withQuery("/videos/export.xls", filters)}`,
   weekly: () => request("/weekly-summaries"),

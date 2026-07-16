@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import {
   CategoryScale,
@@ -75,20 +75,31 @@ function App() {
   const [dailyChanges, setDailyChanges] = useState([]);
   const [weekly, setWeekly] = useState([]);
   const [health, setHealth] = useState(null);
+  const [browserCache, setBrowserCache] = useState(null);
+  const [cacheCleaning, setCacheCleaning] = useState(false);
+  const [cacheMessage, setCacheMessage] = useState("");
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
   const [showForm, setShowForm] = useState(false);
   const [captureId, setCaptureId] = useState(null);
   const [videoFilters, setVideoFilters] = useState({ account_id: "", range: "all", limit: "120" });
   const [dailyFilters, setDailyFilters] = useState({ account_id: "", limit: "120" });
+  const [hotFilters, setHotFilters] = useState({ range: "3", customMonths: "3" });
+  const hotRequestIdRef = useRef(0);
 
   const resolvedVideoFilters = useMemo(() => resolveVideoFilters(videoFilters), [videoFilters]);
+  const resolvedHotFilters = useMemo(() => resolveHotVideoFilters(hotFilters), [hotFilters]);
   const latestDataTime = useMemo(
     () => getLatestDataTime([...jobs, ...accountDashboardRows, ...topLikedVideos, ...dailyChanges]),
     [jobs, accountDashboardRows, topLikedVideos, dailyChanges]
   );
 
-  async function refresh(videoQuery = resolvedVideoFilters, dailyQuery = dailyFilters) {
+  async function refresh({
+    videoQuery = resolvedVideoFilters,
+    dailyQuery = dailyFilters,
+    hotQuery = resolvedHotFilters
+  } = {}) {
+    const hotRequestId = ++hotRequestIdRef.current;
     setLoading(true);
     setError("");
     try {
@@ -99,7 +110,7 @@ function App() {
         api.accountDashboardRows(),
         api.jobs(),
         api.videos(videoQuery),
-        api.hotVideos(),
+        api.hotVideos(hotQuery),
         api.topLikedVideos({ limit: 5 }),
         api.dailyChanges(dailyQuery),
         api.weekly()
@@ -110,30 +121,52 @@ function App() {
       setAccountDashboardRows(accountRowsData);
       setJobs(jobsData);
       setVideos(videosData);
-      setHotVideos(hotData);
+      if (hotRequestId === hotRequestIdRef.current) setHotVideos(hotData);
       setTopLikedVideos(topLikedData);
       setDailyChanges(dailyData);
       setWeekly(weeklyData);
     } catch (err) {
-      setError(err.message);
+      if (hotRequestId === hotRequestIdRef.current) setError(err.message);
     } finally {
-      setLoading(false);
+      if (hotRequestId === hotRequestIdRef.current) setLoading(false);
     }
   }
 
   useEffect(() => {
-    refresh(resolvedVideoFilters, dailyFilters);
+    refresh();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  useEffect(() => {
+    if (active !== "settings") return;
+    api.browserCacheStatus().then(setBrowserCache).catch((err) => setError(err.message));
+  }, [active]);
+
   async function applyVideoFilters(nextFilters) {
     setVideoFilters(nextFilters);
-    await refresh(resolveVideoFilters(nextFilters), dailyFilters);
+    await refresh({ videoQuery: resolveVideoFilters(nextFilters) });
   }
 
   async function applyDailyFilters(nextFilters) {
     setDailyFilters(nextFilters);
-    await refresh(resolvedVideoFilters, nextFilters);
+    await refresh({ dailyQuery: nextFilters });
+  }
+
+  async function applyHotFilters(nextFilters) {
+    const hotRequestId = ++hotRequestIdRef.current;
+    setLoading(true);
+    setError("");
+    try {
+      const nextVideos = await api.hotVideos(resolveHotVideoFilters(nextFilters));
+      if (hotRequestId === hotRequestIdRef.current) {
+        setHotVideos(nextVideos);
+        setHotFilters(nextFilters);
+      }
+    } catch (err) {
+      if (hotRequestId === hotRequestIdRef.current) setError(err.message);
+    } finally {
+      if (hotRequestId === hotRequestIdRef.current) setLoading(false);
+    }
   }
 
   async function handleCapture(accountId) {
@@ -141,7 +174,7 @@ function App() {
     setError("");
     try {
       await api.captureAccount(accountId);
-      await refresh(resolvedVideoFilters, dailyFilters);
+      await refresh();
       setActive("jobs");
     } catch (err) {
       setError(err.message);
@@ -157,7 +190,7 @@ function App() {
     try {
       await api.createAccount(payload);
       setShowForm(false);
-      await refresh(resolvedVideoFilters, dailyFilters);
+      await refresh();
       setActive("accounts");
     } catch (err) {
       setError(err.message);
@@ -168,7 +201,7 @@ function App() {
     setError("");
     try {
       await api.updateAccount(id, payload);
-      await refresh(resolvedVideoFilters, dailyFilters);
+      await refresh();
     } catch (err) {
       setError(err.message);
     }
@@ -181,7 +214,7 @@ function App() {
     setError("");
     try {
       await api.deleteAccount(account.id);
-      await refresh(resolvedVideoFilters, dailyFilters);
+      await refresh();
     } catch (err) {
       setError(err.message);
     }
@@ -196,9 +229,34 @@ function App() {
     setError("");
     try {
       await api.clearAccountData(account.id);
-      await refresh(resolvedVideoFilters, dailyFilters);
+      await refresh();
     } catch (err) {
       setError(err.message);
+    }
+  }
+
+  async function handleCleanBrowserCache() {
+    const reclaimable = formatBytes(browserCache?.reclaimableBytes || 0);
+    const confirmed = window.confirm(
+      `将清理约 ${reclaimable} 的网页、代码和图形缓存。不会删除登录状态、Cookie、采集数据和数据库。是否继续？`
+    );
+    if (!confirmed) return;
+
+    setCacheCleaning(true);
+    setCacheMessage("");
+    setError("");
+    try {
+      const result = await api.cleanBrowserCache();
+      setCacheMessage(
+        result.success
+          ? `清理完成，已释放 ${formatBytes(result.releasedBytes)}。登录状态和采集数据均已保留。`
+          : `已释放 ${formatBytes(result.releasedBytes)}，但有 ${result.failedPaths.length} 个缓存项被占用，请关闭采集窗口后重试。`
+      );
+      setBrowserCache(await api.browserCacheStatus());
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setCacheCleaning(false);
     }
   }
 
@@ -261,7 +319,7 @@ function App() {
               <span>{formatShortDate(new Date())}</span>
               <em>更新 {formatDate(latestDataTime)}</em>
             </div>
-            <button className="ghost-button" onClick={() => refresh(resolvedVideoFilters, dailyFilters)} disabled={loading}>
+            <button className="ghost-button" onClick={() => refresh()} disabled={loading}>
               <RefreshCw size={16} />
               刷新
             </button>
@@ -332,10 +390,20 @@ function App() {
             onApplyFilters={applyDailyFilters}
           />
         )}
-        {active === "hot" && <HotVideos videos={hotVideos} />}
+        {active === "hot" && (
+          <HotVideos videos={hotVideos} filters={hotFilters} onApplyFilters={applyHotFilters} />
+        )}
         {active === "jobs" && <Jobs jobs={jobs} />}
         {active === "weekly" && <Weekly weekly={weekly} accounts={accounts} />}
-        {active === "settings" && <SettingsPanel health={health} />}
+        {active === "settings" && (
+          <SettingsPanel
+            health={health}
+            browserCache={browserCache}
+            cacheCleaning={cacheCleaning}
+            cacheMessage={cacheMessage}
+            onCleanBrowserCache={handleCleanBrowserCache}
+          />
+        )}
       </main>
 
       {showForm && <AccountForm onClose={() => setShowForm(false)} onSubmit={handleCreateAccount} />}
@@ -833,11 +901,61 @@ function DailyChanges({ rows, accounts, filters, onApplyFilters }) {
   );
 }
 
-function HotVideos({ videos }) {
+function HotVideos({ videos, filters, onApplyFilters }) {
+  const [draft, setDraft] = useState(filters);
+  useEffect(() => setDraft(filters), [filters]);
+
+  function updateRange(range) {
+    const next = { ...draft, range };
+    setDraft(next);
+    if (range !== "custom") onApplyFilters(next);
+  }
+
+  function submitFilters(event) {
+    event.preventDefault();
+    onApplyFilters(draft);
+  }
+
   return (
     <section className="panel">
       <PanelHeader title="爆款视频" icon={Activity} />
-      <div className="result-note">当单条视频最新点赞数达到账号设置的“点赞预警线”时，会出现在这里。预警线为 0 表示不启用。</div>
+      <form className="filter-bar hot-video-filter" onSubmit={submitFilters}>
+        <label>
+          发布时间
+          <select value={draft.range} onChange={(event) => updateRange(event.target.value)}>
+            <option value="1">近 1 个月</option>
+            <option value="3">近 3 个月</option>
+            <option value="6">近 6 个月</option>
+            <option value="12">近 12 个月</option>
+            <option value="custom">自定义近几个月</option>
+            <option value="all">全部时间</option>
+          </select>
+        </label>
+        {draft.range === "custom" && (
+          <label>
+            近几个月
+            <span className="month-input-wrap">
+              <input
+                type="number"
+                min="1"
+                max="120"
+                step="1"
+                required
+                value={draft.customMonths}
+                onChange={(event) => setDraft({ ...draft, customMonths: event.target.value })}
+              />
+              <span>个月</span>
+            </span>
+          </label>
+        )}
+        <div className="filter-summary">当前显示 {videos.length} 条 · {hotVideoRangeLabel(filters)}</div>
+        {draft.range === "custom" && (
+          <div className="filter-actions">
+            <button className="small-button" type="submit"><Filter size={14} />应用时间范围</button>
+          </div>
+        )}
+      </form>
+      <div className="result-note">仅显示所选发布时间内，最新点赞数达到账号“点赞预警线”的视频。预警线为 0 表示不启用。</div>
       <div className="table-wrap">
         <table>
           <thead>
@@ -867,7 +985,7 @@ function HotVideos({ videos }) {
             ))}
           </tbody>
         </table>
-        {videos.length === 0 && <Empty text="暂无超过点赞预警线的视频。" />}
+        {videos.length === 0 && <Empty text={`在${hotVideoRangeLabel(filters)}内，暂无超过点赞预警线的视频。`} />}
       </div>
     </section>
   );
@@ -984,17 +1102,41 @@ function WeeklyTable({ weekly, compact = false }) {
   );
 }
 
-function SettingsPanel({ health }) {
+function SettingsPanel({ health, browserCache, cacheCleaning, cacheMessage, onCleanBrowserCache }) {
   return (
-    <section className="panel settings-panel">
-      <PanelHeader title="设置与边界" icon={Database} />
-      <div className="settings-grid">
-        <div><span>数据库位置</span><strong>{health?.dbPath || "读取中"}</strong></div>
-        <div><span>访问范围</span><strong>仅本机 localhost</strong></div>
-        <div><span>自动采集</span><strong>本地服务启动后每 1 小时检查一次，到期账号自动采集</strong></div>
-        <div><span>采集边界</span><strong>只采集公开可见聚合指标，不采集评论用户、粉丝列表、私信、视频文件</strong></div>
-      </div>
-    </section>
+    <div className="settings-stack">
+      <section className="panel settings-panel">
+        <PanelHeader title="设置与边界" icon={Database} />
+        <div className="settings-grid">
+          <div><span>数据库位置</span><strong>{health?.dbPath || "读取中"}</strong></div>
+          <div><span>访问范围</span><strong>仅本机 localhost</strong></div>
+          <div><span>自动采集</span><strong>本地服务启动后按账号设置时间自动采集</strong></div>
+          <div><span>采集边界</span><strong>只采集公开可见聚合指标，不采集评论用户、粉丝列表、私信、视频文件</strong></div>
+        </div>
+      </section>
+
+      <section className="panel">
+        <PanelHeader title="浏览器缓存管理" icon={Database} />
+        <div className="settings-grid cache-summary">
+          <div><span>浏览器数据总占用</span><strong>{formatBytes(browserCache?.totalBytes)}</strong></div>
+          <div><span>本次可安全清理</span><strong>{formatBytes(browserCache?.reclaimableBytes)}</strong></div>
+          <div><span>登录数据</span><strong>保留 Cookie、登录状态和本地存储</strong></div>
+        </div>
+        <p className="cache-note">只清理网页、代码和图形缓存，不会删除数据库或账号历史数据。</p>
+        <div className="cache-actions">
+          <button
+            className="primary-button"
+            onClick={onCleanBrowserCache}
+            disabled={cacheCleaning || browserCache?.captureRunning || !browserCache?.reclaimableBytes}
+          >
+            <Trash2 size={15} />
+            {cacheCleaning ? "正在清理…" : "清理浏览器缓存"}
+          </button>
+          {browserCache?.captureRunning && <span className="cache-warning">当前有采集任务，结束后才能清理。</span>}
+          {cacheMessage && <span className="cache-success">{cacheMessage}</span>}
+        </div>
+      </section>
+    </div>
   );
 }
 
@@ -1189,6 +1331,21 @@ function resolveVideoFilters(filters) {
   return result;
 }
 
+function resolveHotVideoFilters(filters) {
+  if (filters.range === "all") return { months: "all" };
+  if (filters.range === "custom") {
+    const months = Math.min(Math.max(Math.floor(Number(filters.customMonths) || 3), 1), 120);
+    return { months: String(months) };
+  }
+  return { months: filters.range || "3" };
+}
+
+function hotVideoRangeLabel(filters) {
+  if (filters.range === "all") return "全部时间";
+  const months = filters.range === "custom" ? resolveHotVideoFilters(filters).months : filters.range;
+  return `近 ${months || 3} 个月`;
+}
+
 function totalInteractionDelta(item) {
   return (item.video_like_delta || 0) + (item.video_comment_delta || 0) + (item.video_favorite_delta || 0);
 }
@@ -1202,6 +1359,19 @@ function signedNumber(value) {
 function formatNumber(value) {
   if (value == null) return "-";
   return new Intl.NumberFormat("zh-CN").format(value);
+}
+
+function formatBytes(value) {
+  if (value == null) return "读取中";
+  if (value < 1024) return `${value} B`;
+  const units = ["KB", "MB", "GB", "TB"];
+  let size = value / 1024;
+  let unitIndex = 0;
+  while (size >= 1024 && unitIndex < units.length - 1) {
+    size /= 1024;
+    unitIndex += 1;
+  }
+  return `${size >= 100 ? size.toFixed(0) : size.toFixed(1)} ${units[unitIndex]}`;
 }
 
 function formatNullable(value) {

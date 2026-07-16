@@ -21,7 +21,7 @@ export function endOfWeek(date = new Date()) {
 export function shouldSchedule(account, now = new Date()) {
   if (!account.is_active || account.capture_frequency === "manual") return false;
 
-  const last = account.last_captured_at ? new Date(account.last_captured_at) : null;
+  const last = lastAttemptAt(account);
   const diffMs = last ? now.getTime() - last.getTime() : Number.POSITIVE_INFINITY;
   const hourMs = 60 * 60 * 1000;
   const dayMs = 24 * hourMs;
@@ -35,17 +35,56 @@ export function shouldSchedule(account, now = new Date()) {
   return false;
 }
 
+export function nextScheduledAt(account, now = new Date()) {
+  if (!account.is_active || account.capture_frequency === "manual") return null;
+
+  const last = lastAttemptAt(account);
+  const hourMs = 60 * 60 * 1000;
+
+  if (account.capture_frequency === "hourly") {
+    return last ? new Date(Math.max(now.getTime(), last.getTime() + hourMs)) : now;
+  }
+  if (account.capture_frequency === "six_hours") {
+    return last ? new Date(Math.max(now.getTime(), last.getTime() + 6 * hourMs)) : now;
+  }
+  if (account.capture_frequency === "daily") return nextDailyAt(last, now, account.preferred_capture_time);
+  if (account.capture_frequency === "weekly") return nextWeeklyAt(last, now, account.preferred_capture_time);
+  return null;
+}
+
 function isDailyDue(last, now, preferredTime) {
   if (!isTimeReached(now, preferredTime)) return false;
   if (!last) return true;
   return localDateKey(last) !== localDateKey(now);
 }
 
+function nextDailyAt(last, now, preferredTime) {
+  const target = targetTime(now, preferredTime);
+  if (last && localDateKey(last) === localDateKey(now)) {
+    target.setDate(target.getDate() + 1);
+    return target;
+  }
+  return now >= target ? now : target;
+}
+
+function nextWeeklyAt(last, now, preferredTime) {
+  const target = targetTime(startOfWeek(now), preferredTime);
+  if (now < target) return target;
+  if (!last || last < target) return now;
+  target.setDate(target.getDate() + 7);
+  return target;
+}
+
 function isTimeReached(now, preferredTime = "09:00") {
-  const [hour, minute] = String(preferredTime || "09:00").split(":").map(Number);
-  const target = new Date(now);
-  target.setHours(Number.isFinite(hour) ? hour : 9, Number.isFinite(minute) ? minute : 0, 0, 0);
+  const target = targetTime(now, preferredTime);
   return now.getTime() >= target.getTime();
+}
+
+function targetTime(date, preferredTime = "09:00") {
+  const [hour, minute] = String(preferredTime || "09:00").split(":").map(Number);
+  const target = new Date(date);
+  target.setHours(Number.isFinite(hour) ? hour : 9, Number.isFinite(minute) ? minute : 0, 0, 0);
+  return target;
 }
 
 function localDateKey(date) {
@@ -53,4 +92,13 @@ function localDateKey(date) {
   const month = String(date.getMonth() + 1).padStart(2, "0");
   const day = String(date.getDate()).padStart(2, "0");
   return `${year}-${month}-${day}`;
+}
+
+function lastAttemptAt(account) {
+  const dates = [account.last_captured_at, account.last_scheduled_at]
+    .filter(Boolean)
+    .map((value) => new Date(value))
+    .filter((value) => !Number.isNaN(value.getTime()));
+  if (!dates.length) return null;
+  return new Date(Math.max(...dates.map((value) => value.getTime())));
 }

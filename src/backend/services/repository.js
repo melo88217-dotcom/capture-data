@@ -388,7 +388,18 @@ function parseLimit(value, fallback = 120) {
 }
 
 export function listDueAccounts() {
-  return listAccounts({ status: "active" }).filter((account) => account.capture_frequency !== "manual");
+  const latestScheduledAttempt = db.prepare(`
+    SELECT MAX(scheduled_at) AS scheduled_at
+    FROM capture_jobs
+    WHERE account_id = ? AND job_type = 'scheduled'
+  `);
+
+  return listAccounts({ status: "active" })
+    .filter((account) => account.capture_frequency !== "manual")
+    .map((account) => ({
+      ...account,
+      last_scheduled_at: latestScheduledAttempt.get(account.id)?.scheduled_at || null
+    }));
 }
 
 export function markJobRunning(jobId) {
@@ -574,7 +585,15 @@ export function listVideos(filters = {}) {
     .all(...params, limit);
 }
 
-export function listHotVideos(limit = 120) {
+export function listHotVideos(filters = {}) {
+  const normalizedFilters =
+    typeof filters === "object" && filters !== null ? filters : { limit: filters };
+  const months = parseHotVideoMonths(normalizedFilters.months);
+  const publishedAtClause = months == null
+    ? ""
+    : "AND datetime(v.published_at) >= datetime('now', ?)";
+  const params = months == null ? [] : [`-${months} months`];
+
   return db
     .prepare(
       `
@@ -604,11 +623,19 @@ export function listHotVideos(limit = 120) {
         AND a.is_active = 1
         AND vs.like_count IS NOT NULL
         AND vs.like_count >= a.like_alert_threshold
+        ${publishedAtClause}
       ORDER BY vs.like_count DESC, datetime(v.published_at) DESC
       LIMIT ?
     `
     )
-    .all(parseLimit(limit, 120));
+    .all(...params, parseLimit(normalizedFilters.limit, 120));
+}
+
+function parseHotVideoMonths(value) {
+  if (value === "all") return null;
+  const parsed = Number(value ?? 3);
+  if (!Number.isFinite(parsed) || parsed < 1) return 3;
+  return Math.min(Math.floor(parsed), 120);
 }
 
 export function listAccountDashboardRows() {

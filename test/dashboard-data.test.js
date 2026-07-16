@@ -127,6 +127,41 @@ test("top liked videos use latest real like count and exclude inactive accounts"
   assert.equal(rows.some((item) => item.title === "inactive high"), false);
 });
 
+test("hot videos default to recent three months and accept a custom month range", () => {
+  const account = createAccount({
+    platform: "douyin",
+    display_name: "recent-hot-videos",
+    profile_url: `https://example.com/recent-hot-videos-${process.pid}`,
+    capture_frequency: "daily",
+    like_alert_threshold: 10
+  });
+  const recentPublishedAt = new Date();
+  recentPublishedAt.setMonth(recentPublishedAt.getMonth() - 1);
+  const olderPublishedAt = new Date();
+  olderPublishedAt.setMonth(olderPublishedAt.getMonth() - 4);
+  const ancientPublishedAt = new Date();
+  ancientPublishedAt.setMonth(ancientPublishedAt.getMonth() - 121);
+
+  addVideo(account.id, "https://example.com/v/recent-hot", "recent hot", recentPublishedAt.toISOString(), 30);
+  addVideo(account.id, "https://example.com/v/older-hot", "older hot", olderPublishedAt.toISOString(), 50);
+  addVideo(account.id, "https://example.com/v/ancient-hot", "ancient hot", ancientPublishedAt.toISOString(), 70);
+
+  const defaultRows = listHotVideos();
+  const sixMonthRows = listHotVideos({ months: "6" });
+  const allRows = listHotVideos({ months: "all" });
+  const invalidRows = listHotVideos({ months: "invalid" });
+  const zeroRows = listHotVideos({ months: "0" });
+  const cappedRows = listHotVideos({ months: "121" });
+
+  assert.equal(defaultRows.some((item) => item.title === "recent hot"), true);
+  assert.equal(defaultRows.some((item) => item.title === "older hot"), false);
+  assert.equal(sixMonthRows.some((item) => item.title === "older hot"), true);
+  assert.equal(allRows.some((item) => item.title === "older hot"), true);
+  assert.equal(invalidRows.some((item) => item.title === "older hot"), false);
+  assert.equal(zeroRows.some((item) => item.title === "older hot"), false);
+  assert.equal(cappedRows.some((item) => item.title === "ancient hot"), false);
+});
+
 test("deleted account data is hidden from inner pages and exports", () => {
   const active = createAccount({
     platform: "douyin",

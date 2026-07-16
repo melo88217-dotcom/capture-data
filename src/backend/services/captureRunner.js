@@ -9,9 +9,15 @@ import {
   markJobRunning,
   saveCaptureResult
 } from "./repository.js";
-import { shouldSchedule } from "../utils/time.js";
+import { nextScheduledAt, shouldSchedule } from "../utils/time.js";
+import {
+  isBrowserCacheCleanupRunning,
+  isBrowserOperationRunning,
+  trackBrowserOperation
+} from "./browserMaintenance.js";
 
 export async function runCaptureJob(jobId) {
+  assertBrowserAvailable();
   const job = getCaptureJob(jobId);
   if (!job) throw new Error("采集任务不存在");
   if (job.status === "running") return job;
@@ -29,8 +35,9 @@ export async function runCaptureJob(jobId) {
 
   try {
     const collector = getCollector(job.platform_code);
+    const collectorOperation = trackBrowserOperation(Promise.resolve().then(() => collector(job)));
     const result = await withTimeout(
-      collector(job),
+      collectorOperation,
       getCaptureJobTimeoutMs(),
       `采集超过最长运行时间 ${Math.round(getCaptureJobTimeoutMs() / 60000)} 分钟，系统已自动结束。`
     );
@@ -77,11 +84,13 @@ function withTimeout(promise, timeoutMs, message) {
 }
 
 export async function enqueueAndRun(accountId, triggerType = "manual_now") {
+  assertBrowserAvailable();
   const job = createCaptureJob(accountId, triggerType);
   return runCaptureJob(job.id);
 }
 
 export function enqueueAndStart(accountId, triggerType = "manual_now") {
+  assertBrowserAvailable();
   const job = createCaptureJob(accountId, triggerType);
   runCaptureJob(job.id).catch((error) => {
     console.error("[capture] background job failed", error);
@@ -90,6 +99,7 @@ export function enqueueAndStart(accountId, triggerType = "manual_now") {
 }
 
 export async function scheduleDueCaptures() {
+  if (isBrowserCacheCleanupRunning() || isBrowserOperationRunning()) return [];
   const now = new Date();
   const accounts = listDueAccounts().filter((account) => shouldSchedule(account, now));
   const jobs = [];
@@ -100,6 +110,21 @@ export async function scheduleDueCaptures() {
   }
 
   return jobs;
+}
+
+function assertBrowserAvailable() {
+  if (!isBrowserCacheCleanupRunning()) return;
+  const error = new Error("浏览器缓存正在清理，请稍后再开始采集。");
+  error.code = "CACHE_CLEANUP_RUNNING";
+  error.statusCode = 409;
+  throw error;
+}
+
+export function nextDueCaptureAt(now = new Date()) {
+  return listDueAccounts()
+    .map((account) => nextScheduledAt(account, now))
+    .filter(Boolean)
+    .reduce((earliest, candidate) => (!earliest || candidate < earliest ? candidate : earliest), null);
 }
 
 let schedulerRunning = false;

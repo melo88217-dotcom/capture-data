@@ -23,10 +23,14 @@ import {
   failInterruptedCaptureJobs,
   updateAccount
 } from "./services/repository.js";
-import { enqueueAndStart, runDueCaptures } from "./services/captureRunner.js";
+import { enqueueAndStart, nextDueCaptureAt, runDueCaptures } from "./services/captureRunner.js";
+import { cleanBrowserCache, getBrowserCacheStatus } from "./services/browserCache.js";
+import { isBrowserCacheCleanupRunning, isBrowserOperationRunning } from "./services/browserMaintenance.js";
+import { closePersistentBrowser } from "./collectors/shared/browserCollector.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const rootDir = path.resolve(__dirname, "../..");
+const browserProfileDir = path.join(rootDir, "data", "browser-profile");
 
 initDatabase();
 const interruptedJobs = failInterruptedCaptureJobs();
@@ -37,6 +41,33 @@ app.use(express.json({ limit: "1mb" }));
 
 app.get("/api/health", (req, res) => {
   res.json({ ok: true, dbPath: getDbPath() });
+});
+
+app.get("/api/browser-cache/status", async (req, res, next) => {
+  try {
+    res.json(
+      await getBrowserCacheStatus({
+        profileDir: browserProfileDir,
+        captureRunning: hasRunningCapture
+      })
+    );
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/api/browser-cache/cleanup", requireLoopback, async (req, res, next) => {
+  try {
+    res.json(
+      await cleanBrowserCache({
+        profileDir: browserProfileDir,
+        captureRunning: hasRunningCapture,
+        prepareForCleanup: closePersistentBrowser
+      })
+    );
+  } catch (error) {
+    next(error);
+  }
 });
 
 app.get("/api/platforms", (req, res) => {
@@ -57,7 +88,9 @@ app.get("/api/accounts/dashboard", (req, res) => {
 
 app.post("/api/accounts", (req, res, next) => {
   try {
-    res.status(201).json(createAccount(req.body));
+    const account = createAccount(req.body);
+    res.status(201).json(account);
+    rescheduleLocalScheduler();
   } catch (error) {
     next(error);
   }
@@ -65,7 +98,9 @@ app.post("/api/accounts", (req, res, next) => {
 
 app.patch("/api/accounts/:id", (req, res, next) => {
   try {
-    res.json(updateAccount(Number(req.params.id), req.body));
+    const account = updateAccount(Number(req.params.id), req.body);
+    res.json(account);
+    rescheduleLocalScheduler();
   } catch (error) {
     next(error);
   }
@@ -73,7 +108,9 @@ app.patch("/api/accounts/:id", (req, res, next) => {
 
 app.delete("/api/accounts/:id", (req, res, next) => {
   try {
-    res.json(deleteAccount(Number(req.params.id)));
+    const account = deleteAccount(Number(req.params.id));
+    res.json(account);
+    rescheduleLocalScheduler();
   } catch (error) {
     next(error);
   }
@@ -114,7 +151,7 @@ app.get("/api/videos", (req, res) => {
 });
 
 app.get("/api/hot-videos", (req, res) => {
-  res.json(listHotVideos(req.query.limit));
+  res.json(listHotVideos(req.query));
 });
 
 app.get("/api/videos/top-liked", (req, res) => {
@@ -169,8 +206,21 @@ app.get(/^\/(?!api).*/, (req, res) => {
 
 app.use((error, req, res, next) => {
   console.error(error);
-  res.status(400).json({ error: error.message || "请求失败" });
+  res.status(error.statusCode || 400).json({ error: error.message || "请求失败", code: error.code });
 });
+
+function hasRunningCapture() {
+  return (
+    isBrowserOperationRunning() ||
+    listCaptureJobs().some((job) => ["pending", "running"].includes(job.status))
+  );
+}
+
+function requireLoopback(req, res, next) {
+  const address = req.socket.remoteAddress || "";
+  if (address === "::1" || address === "127.0.0.1" || address.startsWith("::ffff:127.")) return next();
+  res.status(403).json({ error: "浏览器缓存只能在本机清理。", code: "LOCAL_ONLY" });
+}
 
 const port = Number(process.env.API_PORT || process.env.BACKEND_PORT || 8102);
 const host = process.env.API_HOST || process.env.BACKEND_HOST || "0.0.0.0";
@@ -179,17 +229,39 @@ app.listen(port, host, () => {
   startLocalScheduler();
 });
 
+let schedulerTimer = null;
+let schedulerStarted = false;
+
 function startLocalScheduler() {
-  const intervalMs = Number(process.env.SCHEDULER_INTERVAL_MS || 60 * 60 * 1000);
-  const run = async () => {
+  schedulerStarted = true;
+  scheduleLocalRun(10 * 1000);
+}
+
+export function rescheduleLocalScheduler() {
+  if (!schedulerStarted) return;
+  if (schedulerTimer) clearTimeout(schedulerTimer);
+  scheduleNextLocalRun();
+}
+
+function scheduleLocalRun(delayMs) {
+  schedulerTimer = setTimeout(async () => {
     try {
       const jobs = await runDueCaptures();
       if (jobs.length) console.log(`[scheduler] finished ${jobs.length} due capture job(s)`);
     } catch (error) {
       console.error("[scheduler] failed", error);
+    } finally {
+      scheduleNextLocalRun();
     }
-  };
+  }, Math.max(0, delayMs));
+}
 
-  setTimeout(run, 10 * 1000);
-  setInterval(run, intervalMs);
+function scheduleNextLocalRun() {
+  if (isBrowserCacheCleanupRunning() || isBrowserOperationRunning()) {
+    scheduleLocalRun(5000);
+    return;
+  }
+  const next = nextDueCaptureAt();
+  if (!next) return;
+  scheduleLocalRun(next.getTime() - Date.now());
 }

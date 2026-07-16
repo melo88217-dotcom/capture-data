@@ -10,6 +10,13 @@ const browserProfileDir = path.join(rootDir, "data", "browser-profile");
 let persistentContext = null;
 let persistentPage = null;
 
+export async function closePersistentBrowser() {
+  if (!persistentContext) return false;
+  const context = persistentContext;
+  await context.close();
+  return true;
+}
+
 const messages = {
   captcha: "\u9875\u9762\u51fa\u73b0\u9a8c\u8bc1\u7801\u6216\u5b89\u5168\u9a8c\u8bc1\uff0c\u7cfb\u7edf\u5df2\u505c\u6b62\u91c7\u96c6\u3002",
   login:
