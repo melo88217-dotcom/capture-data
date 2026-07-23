@@ -49,6 +49,11 @@ npx playwright install chromium
 - `CAPTURE_TIMEOUT_MS`
 - `CAPTURE_SETTLE_MS`
 - `CAPTURE_VIDEO_LIMIT`
+- `CAPTURE_PROFILE_READY_TIMEOUT_MS`：主页在判定渲染不完整前的最长等待时间。
+- `CAPTURE_DETAIL_SETTLE_MS` / `CAPTURE_DETAIL_JITTER_MS`：视频详情访问的基础间隔与随机抖动。
+- `CAPTURE_ACCOUNT_COOLDOWN_MS`：连续账号或重试尝试之间的最小冷却时间。
+- `CAPTURE_RETRY_DELAYS_MS`：可恢复失败的重试退避时间，默认 1 分钟、5 分钟、20 分钟。
+- `CAPTURE_CIRCUIT_THRESHOLD` / `CAPTURE_CIRCUIT_BREAK_MS`：连续最终失败达到阈值后的平台保护暂停时间。
 
 ## 本地数据
 

@@ -24,6 +24,7 @@ data/private/
 logs/
 *.log
 *.pid
+.playwright-cli/
 .project-ports.lock
 
 # Caches and dependencies

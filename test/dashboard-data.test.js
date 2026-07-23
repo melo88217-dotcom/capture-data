@@ -7,8 +7,10 @@ const testDbPath = path.join(os.tmpdir(), `capture-dashboard-data-${process.pid}
 process.env.SQLITE_PATH = testDbPath;
 
 const { initDatabase, db } = await import("../src/backend/db/database.js");
+const { isImplausibleMetricChange } = await import("../src/backend/utils/dataQuality.js");
 const {
   clearAccountCaptureData,
+  computeWeeklySummaries,
   createCaptureJob,
   createAccount,
   deleteAccount,
@@ -19,10 +21,19 @@ const {
   getOverview,
   listVideos,
   listWeeklySummaries,
-  listTopLikedVideos
+  listTopLikedVideos,
+  saveCaptureResult
 } = await import("../src/backend/services/repository.js");
 
 initDatabase();
+
+test("metric quality guard handles nulls and both discontinuity directions at its boundaries", () => {
+  assert.equal(isImplausibleMetricChange(null, 1000), false);
+  assert.equal(isImplausibleMetricChange(100, 81), false);
+  assert.equal(isImplausibleMetricChange(100, 26), false);
+  assert.equal(isImplausibleMetricChange(100, 25), true);
+  assert.equal(isImplausibleMetricChange(25, 100), true);
+});
 
 test("overview totals include only the current week's summaries", () => {
   const account = createAccount({
@@ -229,7 +240,7 @@ test("daily changes keep same-day available follower snapshot when later capture
   assert.equal(rows[0].follower_count_status, "available");
 });
 
-test("daily changes do not treat failed video metric snapshots as zero", () => {
+test("daily changes carry the last valid video metrics across a failed capture", () => {
   const account = createAccount({
     platform: "douyin",
     display_name: "daily-video-failed-not-zero",
@@ -268,16 +279,365 @@ test("daily changes do not treat failed video metric snapshots as zero", () => {
   const failedDay = rows.find((row) => row.day === "2026-07-06");
   const recoveredDay = rows.find((row) => row.day === "2026-07-08");
 
-  assert.equal(failedDay.like_total, null);
-  assert.equal(failedDay.comment_total, null);
-  assert.equal(failedDay.favorite_total, null);
-  assert.equal(failedDay.like_delta, null);
-  assert.equal(failedDay.comment_delta, null);
-  assert.equal(failedDay.favorite_delta, null);
+  assert.equal(failedDay.like_total, 200);
+  assert.equal(failedDay.comment_total, 20);
+  assert.equal(failedDay.favorite_total, 10);
+  assert.equal(failedDay.like_delta, 0);
+  assert.equal(failedDay.comment_delta, 0);
+  assert.equal(failedDay.favorite_delta, 0);
   assert.equal(recoveredDay.like_total, 220);
-  assert.equal(recoveredDay.like_delta, null);
-  assert.equal(recoveredDay.comment_delta, null);
-  assert.equal(recoveredDay.favorite_delta, null);
+  assert.equal(recoveredDay.like_delta, 20);
+  assert.equal(recoveredDay.comment_delta, 2);
+  assert.equal(recoveredDay.favorite_delta, 1);
+});
+
+test("daily changes keep prior video totals when a capture returns no videos", () => {
+  const account = createAccount({
+    platform: "douyin",
+    display_name: "daily-empty-video-capture",
+    profile_url: `https://example.com/daily-empty-video-capture-${process.pid}`,
+    capture_frequency: "daily"
+  });
+  const video = db.prepare(
+    `INSERT INTO videos (account_id, video_url, title, published_at) VALUES (?, ?, ?, ?)`
+  ).run(
+    account.id,
+    `https://example.com/v/daily-empty-video-capture-${process.pid}`,
+    "carried video",
+    "2026-07-01T00:00:00.000Z"
+  ).lastInsertRowid;
+
+  db.prepare(
+    `INSERT INTO account_snapshots (
+      account_id, captured_at, follower_count, follower_count_status, raw_follower_text, source_url
+    ) VALUES (?, ?, 1000, 'available', '1000', ?), (?, ?, 1001, 'available', '1001', ?)`
+  ).run(
+    account.id, "2026-07-10T01:00:00.000Z", account.profile_url,
+    account.id, "2026-07-11T01:00:00.000Z", account.profile_url
+  );
+  db.prepare(
+    `INSERT INTO video_snapshots (
+      video_id, captured_at, like_count, comment_count, favorite_count,
+      like_count_status, comment_count_status, favorite_count_status
+    ) VALUES (?, ?, 234400, 32000, 22000, 'available', 'available', 'available')`
+  ).run(video, "2026-07-10T01:00:00.000Z");
+
+  const rows = listDailyChanges({ account_id: account.id, limit: "10" });
+  const emptyDay = rows.find((row) => row.day === "2026-07-11");
+
+  assert.equal(emptyDay.video_count, 1);
+  assert.equal(emptyDay.like_total, 234400);
+  assert.equal(emptyDay.comment_total, 32000);
+  assert.equal(emptyDay.favorite_total, 22000);
+  assert.equal(emptyDay.like_delta, 0);
+  assert.equal(emptyDay.comment_delta, 0);
+  assert.equal(emptyDay.favorite_delta, 0);
+});
+
+test("daily changes compare the same videos when the capture sample rotates", () => {
+  const account = createAccount({
+    platform: "douyin",
+    display_name: "daily-rotating-video-sample",
+    profile_url: `https://example.com/daily-rotating-video-sample-${process.pid}`,
+    capture_frequency: "daily"
+  });
+  const insertVideo = db.prepare(
+    `INSERT INTO videos (account_id, video_url, title, published_at) VALUES (?, ?, ?, ?)`
+  );
+  const stableVideo = insertVideo.run(
+    account.id, `https://example.com/v/stable-${process.pid}`, "stable", "2026-07-01T00:00:00.000Z"
+  ).lastInsertRowid;
+  const missingVideo = insertVideo.run(
+    account.id, `https://example.com/v/missing-${process.pid}`, "missing", "2026-07-01T00:00:00.000Z"
+  ).lastInsertRowid;
+  const newlySeenVideo = insertVideo.run(
+    account.id, `https://example.com/v/newly-seen-${process.pid}`, "newly seen", "2026-06-01T00:00:00.000Z"
+  ).lastInsertRowid;
+
+  db.prepare(
+    `INSERT INTO account_snapshots (
+      account_id, captured_at, follower_count, follower_count_status, raw_follower_text, source_url
+    ) VALUES (?, ?, 1000, 'available', '1000', ?), (?, ?, 1001, 'available', '1001', ?)`
+  ).run(
+    account.id, "2026-07-20T01:00:00.000Z", account.profile_url,
+    account.id, "2026-07-21T01:00:00.000Z", account.profile_url
+  );
+  const insertSnapshot = db.prepare(
+    `INSERT INTO video_snapshots (
+      video_id, captured_at, like_count, comment_count, favorite_count,
+      like_count_status, comment_count_status, favorite_count_status
+    ) VALUES (?, ?, ?, ?, ?, 'available', 'available', 'available')`
+  );
+  insertSnapshot.run(stableVideo, "2026-07-20T01:00:00.000Z", 100, 10, 5);
+  insertSnapshot.run(missingVideo, "2026-07-20T01:00:00.000Z", 500, 50, 25);
+  insertSnapshot.run(stableVideo, "2026-07-21T01:00:00.000Z", 107, 12, 6);
+  insertSnapshot.run(newlySeenVideo, "2026-07-21T01:00:00.000Z", 10000, 900, 800);
+
+  const rows = listDailyChanges({ account_id: account.id, limit: "10" });
+  const rotatedDay = rows.find((row) => row.day === "2026-07-21");
+
+  assert.equal(rotatedDay.video_count, 3);
+  assert.equal(rotatedDay.like_total, 10607);
+  assert.equal(rotatedDay.comment_total, 962);
+  assert.equal(rotatedDay.favorite_total, 831);
+  assert.equal(rotatedDay.like_delta, 7);
+  assert.equal(rotatedDay.comment_delta, 2);
+  assert.equal(rotatedDay.favorite_delta, 1);
+});
+
+test("limited daily changes seed totals before the requested window", () => {
+  const account = createAccount({
+    platform: "douyin",
+    display_name: "daily-window-seed",
+    profile_url: `https://example.com/daily-window-seed-${process.pid}`,
+    capture_frequency: "daily"
+  });
+  const videoId = db.prepare(
+    "INSERT INTO videos (account_id, video_url, title) VALUES (?, ?, 'window seed')"
+  ).run(account.id, `https://example.com/v/daily-window-seed-${process.pid}`).lastInsertRowid;
+  const insertAccountSnapshot = db.prepare(
+    `INSERT INTO account_snapshots (
+       account_id, captured_at, follower_count, follower_count_status, raw_follower_text, source_url
+     ) VALUES (?, ?, ?, 'available', ?, ?)`
+  );
+  const insertVideoSnapshot = db.prepare(
+    `INSERT INTO video_snapshots (
+       video_id, captured_at, like_count, comment_count, favorite_count,
+       like_count_status, comment_count_status, favorite_count_status
+     ) VALUES (?, ?, ?, ?, ?, 'available', 'available', 'available')`
+  );
+  for (let day = 1; day <= 30; day += 1) {
+    const capturedAt = new Date(Date.UTC(2026, 5, day, 1)).toISOString();
+    insertAccountSnapshot.run(account.id, capturedAt, 1000 + day, String(1000 + day), account.profile_url);
+    insertVideoSnapshot.run(videoId, capturedAt, 100 + day, 10 + day, 5 + day);
+  }
+
+  const rows = listDailyChanges({ account_id: account.id, limit: 2 });
+
+  assert.equal(rows.length, 2);
+  assert.equal(rows[0].day, "2026-06-30");
+  assert.equal(rows[0].like_total, 130);
+  assert.equal(rows[0].like_delta, 1);
+  assert.equal(rows[1].day, "2026-06-29");
+  assert.equal(rows[1].like_total, 129);
+  assert.equal(rows[1].like_delta, null);
+});
+
+test("capture persistence quarantines implausible follower and video metric drops", () => {
+  const account = createAccount({
+    platform: "douyin",
+    display_name: "capture-quality-guard",
+    profile_url: `https://example.com/capture-quality-guard-${process.pid}`,
+    capture_frequency: "daily",
+    like_alert_threshold: 100
+  });
+  const firstJob = createCaptureJob(account.id, "manual_now");
+  const secondJob = createCaptureJob(account.id, "manual_now");
+  const videoUrl = `https://example.com/v/capture-quality-guard-${process.pid}`;
+  const baseResult = {
+    status: "success",
+    error_code: null,
+    error_message: null,
+    account: {
+      profile_url: account.profile_url,
+      follower_count: 10000,
+      follower_count_status: "available",
+      raw_follower_text: "1.0万"
+    },
+    videos: [{
+      video_url: videoUrl,
+      title: "quality guarded video",
+      like_count: 1000,
+      comment_count: 100,
+      favorite_count: 50,
+      like_count_status: "available",
+      comment_count_status: "available",
+      favorite_count_status: "available"
+    }]
+  };
+
+  saveCaptureResult(firstJob, { ...baseResult, captured_at: "2026-07-22T01:00:00.000Z" });
+  const quality = saveCaptureResult(secondJob, {
+    ...baseResult,
+    captured_at: "2026-07-23T01:00:00.000Z",
+    account: { ...baseResult.account, follower_count: 4, raw_follower_text: "4" },
+    videos: [{
+      ...baseResult.videos[0],
+      like_count: 20,
+      comment_count: 1,
+      favorite_count: 1
+    }]
+  });
+
+  const latestAccountSnapshot = db.prepare(
+    "SELECT * FROM account_snapshots WHERE account_id = ? ORDER BY captured_at DESC, id DESC LIMIT 1"
+  ).get(account.id);
+  const latestVideoSnapshot = db.prepare(
+    `SELECT vs.* FROM video_snapshots vs JOIN videos v ON v.id = vs.video_id
+     WHERE v.account_id = ? ORDER BY vs.captured_at DESC, vs.id DESC LIMIT 1`
+  ).get(account.id);
+  const savedAccount = db.prepare("SELECT latest_follower_count FROM accounts WHERE id = ?").get(account.id);
+  const listedVideo = listVideos({ account_id: account.id })[0];
+  const topVideo = listTopLikedVideos(10000).find((video) => video.video_url === videoUrl);
+  const hotVideo = listHotVideos({ months: "all", limit: 10000 }).find((video) => video.video_url === videoUrl);
+
+  assert.equal(latestAccountSnapshot.follower_count_status, "failed");
+  assert.equal(latestVideoSnapshot.like_count_status, "failed");
+  assert.equal(latestVideoSnapshot.comment_count_status, "failed");
+  assert.equal(latestVideoSnapshot.favorite_count_status, "failed");
+  assert.equal(savedAccount.latest_follower_count, 10000);
+  assert.equal(quality.warnings.length, 4);
+  assert.equal(listedVideo.like_count, 1000);
+  assert.equal(listedVideo.comment_count, 100);
+  assert.equal(listedVideo.favorite_count, 50);
+  assert.equal(topVideo.like_count, 1000);
+  assert.equal(hotVideo.like_count, 1000);
+});
+
+test("capture persistence quarantines an isolated upward spike and accepts a corroborated new range", () => {
+  const account = createAccount({
+    platform: "douyin",
+    display_name: "capture-quality-confirmation",
+    profile_url: `https://example.com/capture-quality-confirmation-${process.pid}`,
+    capture_frequency: "daily"
+  });
+  const videoUrl = `https://example.com/v/capture-quality-confirmation-${process.pid}`;
+  const resultFor = (capturedAt, followerCount, likeCount) => ({
+    captured_at: capturedAt,
+    status: "success",
+    account: {
+      profile_url: account.profile_url,
+      follower_count: followerCount,
+      follower_count_status: "available",
+      raw_follower_text: String(followerCount)
+    },
+    videos: [{
+      video_url: videoUrl,
+      title: "quality confirmation video",
+      like_count: likeCount,
+      comment_count: 100,
+      favorite_count: 50,
+      like_count_status: "available",
+      comment_count_status: "available",
+      favorite_count_status: "available"
+    }]
+  });
+
+  saveCaptureResult(
+    createCaptureJob(account.id, "manual_now"),
+    resultFor("2026-07-25T01:00:00.000Z", 100, 100)
+  );
+  const spike = saveCaptureResult(
+    createCaptureJob(account.id, "manual_now"),
+    resultFor("2026-07-26T01:00:00.000Z", 10000, 10000)
+  );
+  const recovery = saveCaptureResult(
+    createCaptureJob(account.id, "manual_now"),
+    resultFor("2026-07-27T01:00:00.000Z", 101, 101)
+  );
+  const pendingRange = saveCaptureResult(
+    createCaptureJob(account.id, "manual_now"),
+    resultFor("2026-07-28T01:00:00.000Z", 10000, 10000)
+  );
+  const confirmedRange = saveCaptureResult(
+    createCaptureJob(account.id, "manual_now"),
+    resultFor("2026-07-29T01:00:00.000Z", 10100, 10100)
+  );
+
+  const snapshots = db.prepare(
+    "SELECT follower_count, follower_count_status FROM account_snapshots WHERE account_id = ? ORDER BY captured_at"
+  ).all(account.id);
+  const listedVideo = listVideos({ account_id: account.id })[0];
+
+  assert.equal(spike.warnings.length, 2);
+  assert.equal(recovery.warnings.length, 0);
+  assert.equal(pendingRange.warnings.length, 2);
+  assert.equal(confirmedRange.warnings.length, 0);
+  assert.deepEqual(snapshots.map((row) => row.follower_count_status), [
+    "available", "failed", "available", "failed", "available"
+  ]);
+  assert.equal(listedVideo.like_count, 10100);
+});
+
+test("capture persistence rejects a video URL already owned by another account", () => {
+  const owner = createAccount({
+    platform: "douyin",
+    display_name: "video-url-owner",
+    profile_url: `https://example.com/video-url-owner-${process.pid}`,
+    capture_frequency: "daily"
+  });
+  const other = createAccount({
+    platform: "douyin",
+    display_name: "video-url-other",
+    profile_url: `https://example.com/video-url-other-${process.pid}`,
+    capture_frequency: "daily"
+  });
+  const sharedUrl = `https://example.com/v/globally-owned-${process.pid}`;
+  const resultFor = (account, capturedAt) => ({
+    captured_at: capturedAt,
+    status: "success",
+    account: {
+      profile_url: account.profile_url,
+      follower_count: 100,
+      follower_count_status: "available",
+      raw_follower_text: "100"
+    },
+    videos: [{
+      video_url: sharedUrl,
+      title: "globally owned video",
+      like_count: 10,
+      comment_count: 1,
+      favorite_count: 1,
+      like_count_status: "available",
+      comment_count_status: "available",
+      favorite_count_status: "available"
+    }]
+  });
+
+  saveCaptureResult(createCaptureJob(owner.id, "manual_now"), resultFor(owner, "2026-07-24T01:00:00.000Z"));
+  const quality = saveCaptureResult(
+    createCaptureJob(other.id, "manual_now"),
+    resultFor(other, "2026-07-24T02:00:00.000Z")
+  );
+
+  const rows = db.prepare("SELECT account_id FROM videos WHERE video_url = ?").all(sharedUrl);
+  assert.deepEqual(rows.map((row) => row.account_id), [owner.id]);
+  assert.equal(quality.rejected_video_count, 1);
+  assert.equal(quality.warnings.length, 1);
+});
+
+test("weekly summaries ignore failed metric snapshots", () => {
+  const account = createAccount({
+    platform: "douyin",
+    display_name: "weekly-failed-metric",
+    profile_url: `https://example.com/weekly-failed-metric-${process.pid}`,
+    capture_frequency: "daily"
+  });
+  const video = db.prepare(
+    `INSERT INTO videos (account_id, video_url, title, published_at) VALUES (?, ?, ?, ?)`
+  ).run(
+    account.id,
+    `https://example.com/v/weekly-failed-metric-${process.pid}`,
+    "weekly failed metric",
+    "2026-07-01T00:00:00.000Z"
+  ).lastInsertRowid;
+  db.prepare(
+    `INSERT INTO video_snapshots (
+      video_id, captured_at, like_count, comment_count, favorite_count,
+      like_count_status, comment_count_status, favorite_count_status
+    ) VALUES
+      (?, '2026-07-06T01:00:00.000Z', 100, 10, 5, 'available', 'available', 'available'),
+      (?, '2026-07-10T01:00:00.000Z', 1, 1, 1, 'failed', 'failed', 'failed')`
+  ).run(video, video);
+
+  computeWeeklySummaries(new Date("2026-07-08T12:00:00.000Z"));
+  const summary = db.prepare(
+    "SELECT * FROM weekly_summaries WHERE account_id = ? ORDER BY id DESC LIMIT 1"
+  ).get(account.id);
+
+  assert.equal(summary.video_like_delta, 0);
+  assert.equal(summary.video_comment_delta, 0);
+  assert.equal(summary.video_favorite_delta, 0);
 });
 
 test("clearing account capture data keeps account settings and removes historical rows", () => {

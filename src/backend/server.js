@@ -32,7 +32,16 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const rootDir = path.resolve(__dirname, "../..");
 const browserProfileDir = path.join(rootDir, "data", "browser-profile");
 
-initDatabase();
+const databaseRepairs = initDatabase();
+if (
+  databaseRepairs.duplicateVideosRemoved ||
+  databaseRepairs.quarantinedMetrics ||
+  databaseRepairs.followerOnlyJobsReclassified
+) {
+  console.warn(
+    `[startup] repaired historical capture data: removed ${databaseRepairs.duplicateVideosRemoved} cross-account video duplicate(s), quarantined ${databaseRepairs.quarantinedMetrics} implausible metric value(s), reclassified ${databaseRepairs.followerOnlyJobsReclassified} follower-only capture job(s)`
+  );
+}
 const interruptedJobs = failInterruptedCaptureJobs();
 if (interruptedJobs) console.log(`[startup] closed ${interruptedJobs} interrupted capture job(s)`);
 

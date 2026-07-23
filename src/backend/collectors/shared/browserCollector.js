@@ -2,13 +2,19 @@ import { mkdirSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { extractFirstMetric } from "./metricParser.js";
+import { FOLLOWER_ONLY_CAPTURE_RESULT } from "../../utils/captureStatus.js";
+import { readNonNegativeNumber } from "../../utils/captureConfig.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const rootDir = path.resolve(__dirname, "../../../..");
 const browserProfileDir = path.join(rootDir, "data", "browser-profile");
+const captureFailureDir = path.join(rootDir, "logs", "capture-failures");
+const maxCanonicalProfileUrls = 1_000;
 
 let persistentContext = null;
 let persistentPage = null;
+let activeCapturePage = null;
+const canonicalProfileUrls = new Map();
 
 export async function closePersistentBrowser() {
   if (!persistentContext) return false;
@@ -17,17 +23,26 @@ export async function closePersistentBrowser() {
   return true;
 }
 
+export async function resetPersistentPage() {
+  const page = activeCapturePage || persistentPage;
+  if (!page) return false;
+  if (activeCapturePage === page) activeCapturePage = null;
+  if (persistentPage === page) persistentPage = null;
+  if (!page.isClosed()) await page.close().catch(() => {});
+  return true;
+}
+
 const messages = {
   captcha: "\u9875\u9762\u51fa\u73b0\u9a8c\u8bc1\u7801\u6216\u5b89\u5168\u9a8c\u8bc1\uff0c\u7cfb\u7edf\u5df2\u505c\u6b62\u91c7\u96c6\u3002",
   login:
     "\u9875\u9762\u8981\u6c42\u767b\u5f55\u540e\u67e5\u770b\u3002\u5df2\u6253\u5f00\u6d4f\u89c8\u5668\u7a97\u53e3\uff0c\u8bf7\u5728\u7a97\u53e3\u91cc\u767b\u5f55\u540e\u518d\u70b9\u4e00\u6b21\u7acb\u5373\u66f4\u65b0\u3002",
   accessDenied: "\u9875\u9762\u8bbf\u95ee\u53d7\u9650\uff0c\u7cfb\u7edf\u4e0d\u4f1a\u7ed5\u8fc7\u6743\u9650\u9650\u5236\u3002",
-  noMetrics:
-    "\u516c\u5f00\u9875\u9762\u53ef\u8bbf\u95ee\uff0c\u4f46\u672a\u8bc6\u522b\u5230\u7c89\u4e1d\u91cf\u6216\u516c\u5f00\u89c6\u9891\u6307\u6807\u3002",
-  linksOnly:
-    "\u53ea\u8bc6\u522b\u5230\u516c\u5f00\u94fe\u63a5\uff0c\u672a\u8bc6\u522b\u5230\u7c89\u4e1d\u91cf\u3001\u70b9\u8d5e\u3001\u8bc4\u8bba\u3001\u6536\u85cf\u7b49\u6838\u5fc3\u6307\u6807\u3002",
   followerMissing:
-    "\u5df2\u91c7\u96c6\u5230\u89c6\u9891\u516c\u5f00\u6307\u6807\uff0c\u4f46\u672a\u8bc6\u522b\u5230\u8d26\u53f7\u4e3b\u9875\u7c89\u4e1d\u6570\uff1b\u53ef\u80fd\u662f\u5e73\u53f0\u61d2\u52a0\u8f7d\u3001\u9875\u9762\u672a\u66b4\u9732\u6216\u9700\u8981\u767b\u5f55\u540e\u624d\u663e\u793a\u3002"
+    "\u5df2\u91c7\u96c6\u5230\u89c6\u9891\u516c\u5f00\u6307\u6807\uff0c\u4f46\u672a\u8bc6\u522b\u5230\u8d26\u53f7\u4e3b\u9875\u7c89\u4e1d\u6570\uff1b\u53ef\u80fd\u662f\u5e73\u53f0\u61d2\u52a0\u8f7d\u3001\u9875\u9762\u672a\u66b4\u9732\u6216\u9700\u8981\u767b\u5f55\u540e\u624d\u663e\u793a\u3002",
+  renderIncomplete:
+    "\u8d26\u53f7\u9875\u5df2\u6253\u5f00\uff0c\u4f46\u7c89\u4e1d\u548c\u89c6\u9891\u533a\u57df\u672a\u5b8c\u6574\u6e32\u67d3\uff1b\u7cfb\u7edf\u5c06\u81ea\u52a8\u6362\u9875\u5e76\u5ef6\u8fdf\u91cd\u8bd5\u3002",
+  videoIncomplete:
+    "\u5df2\u8bc6\u522b\u5230\u516c\u5f00\u89c6\u9891\u94fe\u63a5\uff0c\u4f46\u8be6\u60c5\u6307\u6807\u672a\u5b8c\u6574\u6e32\u67d3\uff1b\u7cfb\u7edf\u5c06\u81ea\u52a8\u91cd\u8bd5\u3002"
 };
 
 const blockedPatterns = [
@@ -35,6 +50,7 @@ const blockedPatterns = [
   ["LOGIN_REQUIRED", messages.login, /\u767b\u5f55\u540e|\u8bf7\u767b\u5f55|\u626b\u7801\u767b\u5f55|login required/i],
   ["ACCESS_DENIED", messages.accessDenied, /\u8bbf\u95ee\u53d7\u9650|\u65e0\u6743\u8bbf\u95ee|\u7981\u6b62\u8bbf\u95ee|access denied|forbidden/i]
 ];
+const blockedCaptureCodes = new Set(blockedPatterns.map(([code]) => code));
 
 export async function collectPublicPage(account, options = {}) {
   const capturedAt = new Date().toISOString();
@@ -42,6 +58,10 @@ export async function collectPublicPage(account, options = {}) {
   const limit = Number(options.limit || process.env.CAPTURE_VIDEO_LIMIT || 30);
   let browser = null;
   let context = null;
+  let page = null;
+  let response = null;
+  let requestFailedHandler = null;
+  const requestFailures = [];
 
   try {
     const { chromium } = await import("playwright");
@@ -53,8 +73,17 @@ export async function collectPublicPage(account, options = {}) {
       context = await getPersistentContext(chromium);
     }
 
-    const page = await getCapturePage(context, headless);
-    await page.goto(account.profile_url, {
+    page = await getCapturePage(context, headless);
+    activeCapturePage = page;
+    requestFailedHandler = (request) => {
+      if (requestFailures.length >= 12) return;
+      requestFailures.push({
+        resource_type: request.resourceType(),
+        error: request.failure()?.errorText || "request failed"
+      });
+    };
+    page.on("requestfailed", requestFailedHandler);
+    response = await page.goto(profileUrlFor(account), {
       waitUntil: "domcontentloaded",
       timeout: Number(process.env.CAPTURE_TIMEOUT_MS || 30000)
     });
@@ -62,41 +91,44 @@ export async function collectPublicPage(account, options = {}) {
     if (profileCheck) return failedResult(account, capturedAt, profileCheck.code, profileCheck.message);
 
     const readyCheck = await waitForProfileReady(page, limit);
-    if (readyCheck) return failedResult(account, capturedAt, readyCheck.code, readyCheck.message);
+    if (readyCheck) {
+      rememberCanonicalProfileUrl(account, page.url());
+      const screenshotPath = await captureFailureScreenshot(page, account, capturedAt, readyCheck.code);
+      return failedResult(account, capturedAt, readyCheck.code, readyCheck.message, {
+        ...readyCheck.diagnostics,
+        http_status: response?.status() || null,
+        request_failures: requestFailures,
+        screenshot_path: screenshotPath
+      });
+    }
     const profileText = await getProfileText(page);
     const follower = extractFollower(profileText);
     const profileUrl = page.url();
+    rememberCanonicalProfileUrl(account, profileUrl);
     const profileVideos = await extractDouyinProfileVideos(page, limit);
+    const profileDiagnostics = {
+      final_url: profileUrl,
+      page_title: await page.title().catch(() => ""),
+      body_text_length: profileText.length,
+      video_link_count: profileVideos.length,
+      follower_status: follower.status,
+      request_failures: requestFailures
+    };
     const videos = [];
 
-    for (const item of profileVideos) {
+    for (const [index, item] of profileVideos.entries()) {
       const detail = await collectVideoDetail(page, item);
       videos.push(detail);
-      await page.waitForTimeout(Number(process.env.CAPTURE_DETAIL_SETTLE_MS || 600));
+      if (index < profileVideos.length - 1) await page.waitForTimeout(getDetailSettleMs());
     }
 
-    const hasFollower = follower.status === "available";
-    const hasVideoMetric = videos.some(
-      (video) =>
-        video.like_count_status === "available" ||
-        video.comment_count_status === "available" ||
-        video.favorite_count_status === "available"
-    );
-    const hasFailedVideoMetric = videos.some(
-      (video) =>
-        video.like_count_status === "failed" ||
-        video.comment_count_status === "failed" ||
-        video.favorite_count_status === "failed"
-    );
-    const hasOnlyLinks = videos.length > 0 && !hasFollower && !hasVideoMetric;
-    const status =
-      hasVideoMetric || (hasFollower && videos.length === 0)
-        ? "success"
-        : hasFollower || hasOnlyLinks || hasFailedVideoMetric
-          ? "partial_success"
-          : "failed";
-    const warningMessage =
-      status === "success" && hasVideoMetric && !hasFollower ? messages.followerMissing : null;
+    const classification = classifyCollectionStatus({ followerStatus: follower.status, videos });
+    const diagnostics = classification.error_code
+      ? {
+          ...profileDiagnostics,
+          screenshot_path: await captureFailureScreenshot(page, account, capturedAt, classification.error_code)
+        }
+      : null;
 
     return {
       platform: account.platform_code,
@@ -108,16 +140,66 @@ export async function collectPublicPage(account, options = {}) {
         raw_follower_text: follower.raw
       },
       videos,
-      status,
-      error_code: status === "success" ? null : "FIELD_NOT_PUBLIC",
-      error_message: warningMessage || (status === "success" ? null : hasOnlyLinks ? messages.linksOnly : messages.noMetrics),
+      ...classification,
+      diagnostics,
       captured_at: capturedAt
     };
   } catch (error) {
-    return failedResult(account, capturedAt, classifyError(error), error.message);
+    const errorCode = classifyError(error);
+    return failedResult(account, capturedAt, errorCode, error.message, {
+      final_url: pageUrl(page),
+      page_title: page ? await page.title().catch(() => "") : "",
+      request_failures: [...requestFailures],
+      http_status: response?.status?.() || null,
+      error_name: error?.name || "Error",
+      error_message: error?.message || String(error),
+      screenshot_path: page ? await captureFailureScreenshot(page, account, capturedAt, errorCode) : null
+    });
   } finally {
+    if (page && requestFailedHandler) page.off("requestfailed", requestFailedHandler);
+    if (activeCapturePage === page) activeCapturePage = null;
     if (headless && browser) await browser.close().catch(() => {});
   }
+}
+
+export function classifyCollectionStatus({ followerStatus, videos = [] }) {
+  const blockedVideo = videos.find((video) => blockedCaptureCodes.has(video.error_code));
+  if (blockedVideo) {
+    return {
+      status: "failed",
+      error_code: blockedVideo.error_code,
+      error_message: blockedVideo.error_message || blockedVideo.raw_metric_text || null
+    };
+  }
+
+  const hasFollower = followerStatus === "available";
+  const hasVideoMetric = videos.some(
+    (video) =>
+      video.like_count_status === "available" ||
+      video.comment_count_status === "available" ||
+      video.favorite_count_status === "available"
+  );
+  const hasOnlyLinks = videos.length > 0 && !hasFollower && !hasVideoMetric;
+  if (hasFollower && videos.length === 0) return { ...FOLLOWER_ONLY_CAPTURE_RESULT };
+  if (hasVideoMetric) {
+    return {
+      status: "success",
+      error_code: null,
+      error_message: hasFollower ? null : messages.followerMissing
+    };
+  }
+  if (videos.length === 0) {
+    return {
+      status: "failed",
+      error_code: "PAGE_RENDER_INCOMPLETE",
+      error_message: messages.renderIncomplete
+    };
+  }
+  return {
+    status: hasFollower || hasOnlyLinks ? "partial_success" : "failed",
+    error_code: "VIDEO_DETAIL_INCOMPLETE",
+    error_message: messages.videoIncomplete
+  };
 }
 
 async function collectVideoDetail(page, item) {
@@ -129,7 +211,15 @@ async function collectVideoDetail(page, item) {
     await waitForVideoDetailContent(page, item.title);
 
     const blocked = await checkBlocked(page);
-    if (blocked) return { ...item, ...emptyVideoMetrics("failed"), raw_metric_text: blocked.message };
+    if (blocked) {
+      return {
+        ...item,
+        ...emptyVideoMetrics("failed"),
+        error_code: blocked.code,
+        error_message: blocked.message,
+        raw_metric_text: blocked.message
+      };
+    }
 
     const title = (await page.title()).replace(/\s*-\s*\u6296\u97f3\s*$/, "").trim() || item.title;
     const text = await getBodyText(page);
@@ -166,34 +256,41 @@ async function extractDouyinProfileVideos(page, limit) {
       nodes
         .map((node) => ({
           href: node.href,
-          text: (node.innerText || node.textContent || "").trim()
+          text: (node.innerText || node.textContent || "").trim(),
+          label: (node.getAttribute("aria-label") || node.querySelector("img")?.getAttribute("alt") || "").trim(),
+          hasMedia: Boolean(node.querySelector("img, video, picture")),
+          visible: node.getBoundingClientRect().width >= 40 && node.getBoundingClientRect().height >= 40
         }))
         .filter((item) => item.href)
     )
     .catch(() => []);
 
+  return buildDouyinProfileVideos(links, limit);
+}
+
+export function buildDouyinProfileVideos(links, limit) {
   const seen = new Set();
   const videos = [];
 
   for (const item of links) {
     const cleanUrl = normalizeDouyinVideoUrl(item.href);
     if (!cleanUrl || seen.has(cleanUrl)) continue;
-    const parsed = parseProfileVideoText(item.text);
-    if (!parsed.title || parsed.like_count == null) continue;
+    const parsed = parseProfileVideoText([item.text, item.label].filter(Boolean).join("\n"));
+    if (!parsed.title && parsed.like_count == null && !(item.hasMedia && item.visible)) continue;
 
     seen.add(cleanUrl);
     videos.push({
       platform_video_id: inferVideoId(cleanUrl),
       video_url: cleanUrl,
-      title: parsed.title,
+      title: parsed.title || item.label || "",
       published_at: null,
       like_count: parsed.like_count,
       comment_count: null,
       favorite_count: null,
-      like_count_status: "available",
+      like_count_status: parsed.like_count == null ? "not_public" : "available",
       comment_count_status: "not_public",
       favorite_count_status: "not_public",
-      raw_metric_text: item.text
+      raw_metric_text: [item.text, item.label].filter(Boolean).join("\n")
     });
 
     if (videos.length >= limit) break;
@@ -212,17 +309,21 @@ async function waitForProfileReady(page, limit) {
   await page.waitForTimeout(settle);
 
   while (Date.now() - started < timeout) {
-    const blocked = await checkBlocked(page);
+    const probe = await getProfileReadyProbe(page);
+    const blocked = matchBlockedContent(probe.title, probe.text);
     if (blocked) return blocked;
 
-    const text = await getProfileText(page);
-    const follower = extractFollower(text);
-    const videoCount = await page.locator('a[href*="/video/"]').count().catch(() => 0);
+    const follower = extractFollower(probe.text);
+    const videoCount = probe.videoCount;
     bestVideoCount = Math.max(bestVideoCount, videoCount);
 
     if (follower.status === "available" && videoCount >= targetVideoCount) return null;
     if (follower.status === "available" && bestVideoCount > 0 && Date.now() - started >= Math.max(settle, 6000)) return null;
-    if (videoCount >= targetVideoCount && hasProfileIdentityText(text) && Date.now() - started >= Math.max(settle, 6000)) {
+    if (
+      videoCount >= targetVideoCount &&
+      hasProfileIdentityText(probe.text) &&
+      Date.now() - started >= Math.max(settle, 6000)
+    ) {
       return null;
     }
 
@@ -230,8 +331,21 @@ async function waitForProfileReady(page, limit) {
     await page.waitForTimeout(1000);
   }
 
-  if (bestVideoCount === 0) await page.waitForTimeout(1000);
-  return null;
+  const text = await getProfileText(page);
+  const follower = extractFollower(text);
+  if (follower.status === "available" || (bestVideoCount > 0 && hasProfileIdentityText(text))) return null;
+  return {
+    code: "PAGE_RENDER_INCOMPLETE",
+    message: messages.renderIncomplete,
+    diagnostics: {
+      final_url: page.url(),
+      page_title: await page.title().catch(() => ""),
+      body_text_length: text.length,
+      video_link_count: bestVideoCount,
+      follower_status: follower.status,
+      identity_found: hasProfileIdentityText(text)
+    }
+  };
 }
 
 async function waitForVideoDetailContent(page, title) {
@@ -374,17 +488,37 @@ function extractPublishedAt(text) {
 export function extractFollower(text) {
   const compact = String(text || "").replace(/\s+/g, "");
   const metricPattern = "([0-9]+(?:\\.[0-9]+)?(?:\\u4e07|w|W|\\u4ebf)?\\+?)";
+  const metricsBeforeLabels = compact.match(
+    new RegExp(`${metricPattern}\\u5173\\u6ce8${metricPattern}\\u7c89\\u4e1d${metricPattern}\\u83b7\\u8d5e`)
+  );
+  if (metricsBeforeLabels) {
+    const parsed = parseMetricLine(metricsBeforeLabels[2]);
+    if (parsed.status === "available") return parsed;
+  }
+
+  const orderedMetrics = compact.match(
+    new RegExp(`\\u5173\\u6ce8${metricPattern}\\u7c89\\u4e1d${metricPattern}\\u83b7\\u8d5e`)
+  );
+  if (orderedMetrics) {
+    const parsed = parseMetricLine(orderedMetrics[2]);
+    if (parsed.status === "available") return parsed;
+  }
+
   const anchoredPatterns = [
-    new RegExp(`\\u5173\\u6ce8${metricPattern}\\u7c89\\u4e1d${metricPattern}\\u83b7\\u8d5e`),
     new RegExp(`\\u7c89\\u4e1d${metricPattern}\\u83b7\\u8d5e`),
     new RegExp(`followers${metricPattern}`, "i")
   ];
 
+  const beforeLabel = compact.match(/([0-9]+(?:\.[0-9]+)?(?:\u4e07|w|W|\u4ebf)?\+?)\u7c89\u4e1d/i);
+  if (beforeLabel) {
+    const parsed = parseMetricLine(beforeLabel[1]);
+    if (parsed.status === "available") return parsed;
+  }
+
   for (const pattern of anchoredPatterns) {
     const match = compact.match(pattern);
     if (!match) continue;
-    const candidate = pattern === anchoredPatterns[0] ? match[2] : match[1];
-    const parsed = parseMetricLine(candidate);
+    const parsed = parseMetricLine(match[1]);
     if (parsed.status === "available") return parsed;
   }
 
@@ -416,10 +550,24 @@ function inferAccountName(text, fallback) {
 async function checkBlocked(page) {
   const title = await page.title().catch(() => "");
   const text = await getBodyText(page);
+  return matchBlockedContent(title, text);
+}
+
+function matchBlockedContent(title, text) {
   for (const [code, message, pattern] of blockedPatterns) {
     if (pattern.test(text) || pattern.test(title)) return { code, message };
   }
   return null;
+}
+
+async function getProfileReadyProbe(page) {
+  return page
+    .evaluate(() => ({
+      title: document.title || "",
+      text: document.body?.innerText || "",
+      videoCount: document.querySelectorAll('a[href*="/video/"]').length
+    }))
+    .catch(() => ({ title: "", text: "", videoCount: 0 }));
 }
 
 async function getProfileText(page) {
@@ -487,6 +635,56 @@ function browserOptions() {
   };
 }
 
+function getDetailSettleMs() {
+  const base = readNonNegativeNumber(process.env.CAPTURE_DETAIL_SETTLE_MS, 2_000);
+  const jitter = readNonNegativeNumber(process.env.CAPTURE_DETAIL_JITTER_MS, 2_000);
+  return base + Math.floor(Math.random() * (jitter + 1));
+}
+
+function profileUrlFor(account) {
+  const sourceUrl = String(account.profile_url || "").trim();
+  const cached = canonicalProfileUrls.get(captureAccountId(account));
+  return cached?.sourceUrl === sourceUrl ? cached.canonicalUrl : sourceUrl;
+}
+
+function rememberCanonicalProfileUrl(account, url) {
+  if (!/^https:\/\/www\.douyin\.com\/user\//.test(String(url || ""))) return;
+  const accountId = captureAccountId(account);
+  canonicalProfileUrls.delete(accountId);
+  canonicalProfileUrls.set(accountId, {
+    sourceUrl: String(account.profile_url || "").trim(),
+    canonicalUrl: String(url).split("?")[0]
+  });
+  while (canonicalProfileUrls.size > maxCanonicalProfileUrls) {
+    canonicalProfileUrls.delete(canonicalProfileUrls.keys().next().value);
+  }
+}
+
+function captureAccountId(account) {
+  return account.account_id || account.id;
+}
+
+function pageUrl(page) {
+  try {
+    return page?.url?.() || null;
+  } catch {
+    return null;
+  }
+}
+
+async function captureFailureScreenshot(page, account, capturedAt, code) {
+  try {
+    mkdirSync(captureFailureDir, { recursive: true });
+    const stamp = capturedAt.replace(/[:.]/g, "-");
+    const accountId = String(account.account_id || account.id || "unknown").replace(/[^a-zA-Z0-9_-]/g, "_");
+    const filePath = path.join(captureFailureDir, `${stamp}-account-${accountId}-${code}.png`);
+    await page.screenshot({ path: filePath, fullPage: false });
+    return filePath;
+  } catch {
+    return null;
+  }
+}
+
 function normalizeDouyinVideoUrl(url) {
   const match = String(url || "").match(/^https:\/\/www\.douyin\.com\/video\/(\d+)/);
   return match ? `https://www.douyin.com/video/${match[1]}` : null;
@@ -515,7 +713,7 @@ function classifyError(error) {
   return "UNKNOWN_ERROR";
 }
 
-function failedResult(account, capturedAt, code, message) {
+function failedResult(account, capturedAt, code, message, diagnostics = null) {
   return {
     platform: account.platform_code,
     account: {
@@ -529,6 +727,7 @@ function failedResult(account, capturedAt, code, message) {
     status: "failed",
     error_code: code,
     error_message: message,
+    diagnostics,
     captured_at: capturedAt
   };
 }

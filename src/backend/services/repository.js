@@ -1,4 +1,5 @@
 import { db } from "../db/database.js";
+import { isImplausibleMetricChange, VIDEO_METRICS } from "../utils/dataQuality.js";
 import { endOfWeek, nowIso, startOfWeek } from "../utils/time.js";
 
 const accountSelect = `
@@ -8,6 +9,36 @@ const accountSelect = `
     p.name AS platform_name
   FROM accounts a
   JOIN platforms p ON p.id = a.platform_id
+`;
+
+const latestVideoMetricsCte = `
+  latest_video_metric_values AS (
+    SELECT
+      v.id AS video_id,
+      (SELECT like_count FROM video_snapshots WHERE video_id = v.id AND like_count_status = 'available' AND like_count IS NOT NULL ORDER BY captured_at DESC, id DESC LIMIT 1) AS like_count,
+      (SELECT comment_count FROM video_snapshots WHERE video_id = v.id AND comment_count_status = 'available' AND comment_count IS NOT NULL ORDER BY captured_at DESC, id DESC LIMIT 1) AS comment_count,
+      (SELECT favorite_count FROM video_snapshots WHERE video_id = v.id AND favorite_count_status = 'available' AND favorite_count IS NOT NULL ORDER BY captured_at DESC, id DESC LIMIT 1) AS favorite_count,
+      (SELECT MAX(captured_at) FROM video_snapshots WHERE video_id = v.id AND (
+        (like_count_status = 'available' AND like_count IS NOT NULL) OR
+        (comment_count_status = 'available' AND comment_count IS NOT NULL) OR
+        (favorite_count_status = 'available' AND favorite_count IS NOT NULL)
+      )) AS captured_at
+    FROM videos v
+  ),
+  latest_video_metrics AS (
+    SELECT
+      values_row.*,
+      CASE WHEN values_row.like_count IS NOT NULL THEN 'available' ELSE COALESCE(raw.like_count_status, 'not_public') END AS like_count_status,
+      CASE WHEN values_row.comment_count IS NOT NULL THEN 'available' ELSE COALESCE(raw.comment_count_status, 'not_public') END AS comment_count_status,
+      CASE WHEN values_row.favorite_count IS NOT NULL THEN 'available' ELSE COALESCE(raw.favorite_count_status, 'not_public') END AS favorite_count_status
+    FROM latest_video_metric_values values_row
+    LEFT JOIN video_snapshots raw ON raw.id = (
+      SELECT id FROM video_snapshots
+      WHERE video_id = values_row.video_id
+      ORDER BY captured_at DESC, id DESC
+      LIMIT 1
+    )
+  )
 `;
 
 function sqlValue(value) {
@@ -413,6 +444,19 @@ export function markJobRunning(jobId) {
   return result.changes > 0;
 }
 
+export function markJobRetrying(jobId, { retryCount, errorCode, errorMessage }) {
+  db.prepare(
+    `
+      UPDATE capture_jobs
+      SET retry_count = ?,
+          error_code = ?,
+          error_message = ?,
+          updated_at = CURRENT_TIMESTAMP
+      WHERE id = ? AND status = 'running'
+    `
+  ).run(retryCount, errorCode || null, errorMessage || null, jobId);
+}
+
 export function markJobFinished(jobId, result) {
   db.prepare(
     `
@@ -437,6 +481,21 @@ export function addCaptureLog(jobId, level, message, context = {}) {
 }
 
 export function saveCaptureResult(job, result) {
+  const warnings = [];
+  const findPreviousFollower = db.prepare(
+    `SELECT
+       (SELECT follower_count FROM account_snapshots
+        WHERE account_id = ? AND follower_count_status = 'available' AND follower_count IS NOT NULL
+        ORDER BY captured_at DESC, id DESC LIMIT 1) AS value,
+       (SELECT follower_count FROM account_snapshots
+        WHERE account_id = ? AND follower_count_status = 'failed' AND follower_count IS NOT NULL
+          AND captured_at > COALESCE((
+            SELECT captured_at FROM account_snapshots
+            WHERE account_id = ? AND follower_count_status = 'available' AND follower_count IS NOT NULL
+            ORDER BY captured_at DESC, id DESC LIMIT 1
+          ), '')
+        ORDER BY captured_at DESC, id DESC LIMIT 1) AS pending_value`
+  );
   const insertSnapshot = db.prepare(
     `
     INSERT INTO account_snapshots (
@@ -445,78 +504,95 @@ export function saveCaptureResult(job, result) {
     VALUES (?, ?, ?, ?, ?, ?, ?)
   `
   );
-
-  insertSnapshot.run(
-    job.account_id,
-    sqlValue(result.captured_at),
-    sqlValue(result.account.follower_count),
-    sqlValue(result.account.follower_count_status),
-    sqlValue(result.account.raw_follower_text),
-    sqlValue(result.account.profile_url),
-    job.id
+  const findVideo = db.prepare("SELECT id, account_id FROM videos WHERE video_url = ? ORDER BY id LIMIT 1");
+  const updateVideo = db.prepare(
+    `
+    UPDATE videos
+    SET platform_video_id = COALESCE(?, platform_video_id),
+        title = COALESCE(?, title),
+        description = COALESCE(?, description),
+        cover_url = COALESCE(?, cover_url),
+        published_at = COALESCE(?, published_at),
+        last_seen_at = CURRENT_TIMESTAMP,
+        updated_at = CURRENT_TIMESTAMP
+    WHERE id = ?
+  `
+  );
+  const insertVideo = db.prepare(
+    `
+    INSERT INTO videos (
+      account_id, platform_video_id, video_url, title, description, cover_url, published_at
+    )
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+  `
+  );
+  const findPreviousVideoMetrics = db.prepare(
+    `SELECT
+       (SELECT like_count FROM video_snapshots WHERE video_id = ? AND like_count_status = 'available' AND like_count IS NOT NULL ORDER BY captured_at DESC, id DESC LIMIT 1) AS like_count,
+       (SELECT like_count FROM video_snapshots WHERE video_id = ? AND like_count_status = 'failed' AND like_count IS NOT NULL AND captured_at > COALESCE((SELECT captured_at FROM video_snapshots WHERE video_id = ? AND like_count_status = 'available' AND like_count IS NOT NULL ORDER BY captured_at DESC, id DESC LIMIT 1), '') ORDER BY captured_at DESC, id DESC LIMIT 1) AS pending_like_count,
+       (SELECT comment_count FROM video_snapshots WHERE video_id = ? AND comment_count_status = 'available' AND comment_count IS NOT NULL ORDER BY captured_at DESC, id DESC LIMIT 1) AS comment_count,
+       (SELECT comment_count FROM video_snapshots WHERE video_id = ? AND comment_count_status = 'failed' AND comment_count IS NOT NULL AND captured_at > COALESCE((SELECT captured_at FROM video_snapshots WHERE video_id = ? AND comment_count_status = 'available' AND comment_count IS NOT NULL ORDER BY captured_at DESC, id DESC LIMIT 1), '') ORDER BY captured_at DESC, id DESC LIMIT 1) AS pending_comment_count,
+       (SELECT favorite_count FROM video_snapshots WHERE video_id = ? AND favorite_count_status = 'available' AND favorite_count IS NOT NULL ORDER BY captured_at DESC, id DESC LIMIT 1) AS favorite_count,
+       (SELECT favorite_count FROM video_snapshots WHERE video_id = ? AND favorite_count_status = 'failed' AND favorite_count IS NOT NULL AND captured_at > COALESCE((SELECT captured_at FROM video_snapshots WHERE video_id = ? AND favorite_count_status = 'available' AND favorite_count IS NOT NULL ORDER BY captured_at DESC, id DESC LIMIT 1), '') ORDER BY captured_at DESC, id DESC LIMIT 1) AS pending_favorite_count`
+  );
+  const insertVideoSnapshot = db.prepare(
+    `
+    INSERT INTO video_snapshots (
+      video_id, captured_at, like_count, comment_count, favorite_count,
+      like_count_status, comment_count_status, favorite_count_status, raw_metric_text, capture_job_id
+    )
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `
   );
 
-  if (result.account.follower_count_status === "available") {
-    db.prepare(
-      `
-      UPDATE accounts
-      SET latest_follower_count = ?,
-          latest_collect_status = ?,
-          last_captured_at = ?,
-          updated_at = CURRENT_TIMESTAMP
-      WHERE id = ?
-    `
-    ).run(result.account.follower_count, result.status, result.captured_at, job.account_id);
-  } else {
-    db.prepare(
-      `
-      UPDATE accounts
-      SET latest_collect_status = ?,
-          last_captured_at = ?,
-          updated_at = CURRENT_TIMESTAMP
-      WHERE id = ?
-    `
-    ).run(result.status, result.captured_at, job.account_id);
-  }
+  db.exec("BEGIN IMMEDIATE");
+  try {
+    const previousFollower = findPreviousFollower.get(job.account_id, job.account_id, job.account_id);
+    const accountMetric = validateIncomingMetric({
+      entityType: "account",
+      entityId: job.account_id,
+      metric: "follower_count",
+      value: result.account.follower_count,
+      status: result.account.follower_count_status,
+      previous: previousFollower?.value,
+      pending: previousFollower?.pending_value,
+      warnings
+    });
+    insertSnapshot.run(
+      job.account_id,
+      sqlValue(result.captured_at),
+      sqlValue(accountMetric.value),
+      sqlValue(accountMetric.status),
+      sqlValue(result.account.raw_follower_text),
+      sqlValue(result.account.profile_url),
+      job.id
+    );
 
-  for (const video of result.videos || []) {
-    const existing = db
-      .prepare("SELECT id FROM videos WHERE account_id = ? AND video_url = ?")
-      .get(job.account_id, video.video_url);
+    for (const video of result.videos || []) {
+      const existing = findVideo.get(video.video_url);
 
-    let videoId = existing?.id;
-    if (videoId) {
-      db.prepare(
-        `
-        UPDATE videos
-        SET platform_video_id = COALESCE(?, platform_video_id),
-            title = COALESCE(?, title),
-            description = COALESCE(?, description),
-            cover_url = COALESCE(?, cover_url),
-            published_at = COALESCE(?, published_at),
-            last_seen_at = CURRENT_TIMESTAMP,
-            updated_at = CURRENT_TIMESTAMP
-        WHERE id = ?
-      `
-      ).run(
-        sqlValue(video.platform_video_id),
-        sqlValue(video.title),
-        sqlValue(video.description || ""),
-        sqlValue(video.cover_url || ""),
-        sqlValue(video.published_at),
-        videoId
-      );
-    } else {
-      videoId = db
-        .prepare(
-          `
-          INSERT INTO videos (
-            account_id, platform_video_id, video_url, title, description, cover_url, published_at
-          )
-          VALUES (?, ?, ?, ?, ?, ?, ?)
-        `
-        )
-        .run(
+      if (existing && existing.account_id !== job.account_id) {
+        warnings.push({
+          type: "video_account_conflict",
+          video_url: video.video_url,
+          owner_account_id: existing.account_id,
+          rejected_account_id: job.account_id
+        });
+        continue;
+      }
+
+      let videoId = existing?.id;
+      if (videoId) {
+        updateVideo.run(
+          sqlValue(video.platform_video_id),
+          sqlValue(video.title),
+          sqlValue(video.description || ""),
+          sqlValue(video.cover_url || ""),
+          sqlValue(video.published_at),
+          videoId
+        );
+      } else {
+        videoId = insertVideo.run(
           job.account_id,
           sqlValue(video.platform_video_id),
           sqlValue(video.video_url),
@@ -525,29 +601,87 @@ export function saveCaptureResult(job, result) {
           sqlValue(video.cover_url || ""),
           sqlValue(video.published_at)
         ).lastInsertRowid;
+      }
+
+      const previous = findPreviousVideoMetrics.get(...Array(9).fill(videoId));
+      const metrics = Object.fromEntries(
+        VIDEO_METRICS.map(({ column, statusColumn }) => [
+          column,
+          validateIncomingMetric({
+            entityType: "video",
+            entityId: videoId,
+            metric: column,
+            value: video[column],
+            status: video[statusColumn],
+            previous: previous[column],
+            pending: previous[`pending_${column}`],
+            warnings
+          })
+        ])
+      );
+
+      insertVideoSnapshot.run(
+        videoId,
+        sqlValue(result.captured_at),
+        sqlValue(metrics.like_count.value),
+        sqlValue(metrics.comment_count.value),
+        sqlValue(metrics.favorite_count.value),
+        sqlValue(metrics.like_count.status),
+        sqlValue(metrics.comment_count.status),
+        sqlValue(metrics.favorite_count.status),
+        sqlValue(video.raw_metric_text || ""),
+        job.id
+      );
     }
 
-    db.prepare(
+    const effectiveStatus = warnings.length > 0 && result.status === "success" ? "partial_success" : result.status;
+    if (accountMetric.status === "available") {
+      db.prepare(
+        `
+        UPDATE accounts
+        SET latest_follower_count = ?,
+            latest_collect_status = ?,
+            last_captured_at = ?,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = ?
       `
-      INSERT INTO video_snapshots (
-        video_id, captured_at, like_count, comment_count, favorite_count,
-        like_count_status, comment_count_status, favorite_count_status, raw_metric_text, capture_job_id
-      )
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `
-    ).run(
-      videoId,
-      sqlValue(result.captured_at),
-      sqlValue(video.like_count),
-      sqlValue(video.comment_count),
-      sqlValue(video.favorite_count),
-      sqlValue(video.like_count_status),
-      sqlValue(video.comment_count_status),
-      sqlValue(video.favorite_count_status),
-      sqlValue(video.raw_metric_text || ""),
-      job.id
-    );
+      ).run(accountMetric.value, effectiveStatus, result.captured_at, job.account_id);
+    } else {
+      db.prepare(
+        `
+        UPDATE accounts
+        SET latest_collect_status = ?,
+            last_captured_at = ?,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = ?
+      `
+      ).run(effectiveStatus, result.captured_at, job.account_id);
+    }
+
+    db.exec("COMMIT");
+    return {
+      warnings,
+      rejected_video_count: warnings.filter((warning) => warning.type === "video_account_conflict").length,
+      effective_status: effectiveStatus
+    };
+  } catch (error) {
+    db.exec("ROLLBACK");
+    throw error;
   }
+}
+
+function validateIncomingMetric({ entityType, entityId, metric, value, status, previous, pending, warnings }) {
+  if (status !== "available" || !isImplausibleMetricChange(previous, value)) return { value, status };
+  if (pending != null && !isImplausibleMetricChange(pending, value)) return { value, status };
+  warnings.push({
+    type: "implausible_metric_drop",
+    entity_type: entityType,
+    entity_id: entityId,
+    metric,
+    previous_value: previous,
+    rejected_value: value
+  });
+  return { value, status: "failed" };
 }
 
 export function listVideos(filters = {}) {
@@ -556,6 +690,7 @@ export function listVideos(filters = {}) {
   return db
     .prepare(
       `
+      WITH ${latestVideoMetricsCte}
       SELECT
         v.*,
         a.display_name AS account_name,
@@ -571,12 +706,7 @@ export function listVideos(filters = {}) {
       FROM videos v
       JOIN accounts a ON a.id = v.account_id
       JOIN platforms p ON p.id = a.platform_id
-      LEFT JOIN video_snapshots vs ON vs.id = (
-        SELECT id FROM video_snapshots
-        WHERE video_id = v.id
-        ORDER BY captured_at DESC
-        LIMIT 1
-      )
+      LEFT JOIN latest_video_metrics vs ON vs.video_id = v.id
       ${where}
       ORDER BY datetime(v.published_at) DESC, v.last_seen_at DESC
       LIMIT ?
@@ -597,6 +727,7 @@ export function listHotVideos(filters = {}) {
   return db
     .prepare(
       `
+      WITH ${latestVideoMetricsCte}
       SELECT
         v.*,
         a.display_name AS account_name,
@@ -613,12 +744,7 @@ export function listHotVideos(filters = {}) {
       FROM videos v
       JOIN accounts a ON a.id = v.account_id
       JOIN platforms p ON p.id = a.platform_id
-      JOIN video_snapshots vs ON vs.id = (
-        SELECT id FROM video_snapshots
-        WHERE video_id = v.id
-        ORDER BY captured_at DESC
-        LIMIT 1
-      )
+      JOIN latest_video_metrics vs ON vs.video_id = v.id
       WHERE a.like_alert_threshold > 0
         AND a.is_active = 1
         AND vs.like_count IS NOT NULL
@@ -667,6 +793,7 @@ export function listTopLikedVideos(limit = 5) {
   return db
     .prepare(
       `
+      WITH ${latestVideoMetricsCte}
       SELECT
         v.*,
         a.display_name AS account_name,
@@ -682,12 +809,7 @@ export function listTopLikedVideos(limit = 5) {
       FROM videos v
       JOIN accounts a ON a.id = v.account_id
       JOIN platforms p ON p.id = a.platform_id
-      JOIN video_snapshots vs ON vs.id = (
-        SELECT id FROM video_snapshots
-        WHERE video_id = v.id
-        ORDER BY captured_at DESC
-        LIMIT 1
-      )
+      JOIN latest_video_metrics vs ON vs.video_id = v.id
       WHERE a.is_active = 1
         AND vs.like_count IS NOT NULL
       ORDER BY vs.like_count DESC, datetime(v.published_at) DESC, datetime(v.updated_at) DESC
@@ -795,16 +917,14 @@ export function listDailyChanges(filters = {}) {
       )
       .all(account.id, account.id, parseLimit(filters.limit, 120));
 
-    const ordered = dates.map((item) => buildDailyRow(account, item.day)).reverse();
+    const orderedDays = dates.map((item) => item.day).reverse();
+    const ordered = buildDailyRows(account, orderedDays);
     for (let index = 0; index < ordered.length; index += 1) {
       const current = ordered[index];
       const previous = ordered[index - 1];
       rows.push({
         ...current,
-        follower_delta: diff(current.follower_count, previous?.follower_count),
-        like_delta: diff(current.like_total, previous?.like_total),
-        comment_delta: diff(current.comment_total, previous?.comment_total),
-        favorite_delta: diff(current.favorite_total, previous?.favorite_total)
+        follower_delta: diff(current.follower_count, previous?.follower_count)
       });
     }
   }
@@ -812,96 +932,128 @@ export function listDailyChanges(filters = {}) {
   return rows.sort((a, b) => b.day.localeCompare(a.day) || a.account_name.localeCompare(b.account_name));
 }
 
-function buildDailyRow(account, day) {
-  const latestSnapshot = db
+function buildDailyRows(account, days) {
+  if (!days.length) return [];
+  const firstDay = days[0];
+  const lastDay = days.at(-1);
+  const accountSnapshots = db
     .prepare(
       `
-      SELECT *
+      SELECT *, date(captured_at, 'localtime') AS day
       FROM account_snapshots
-      WHERE account_id = ? AND date(captured_at, 'localtime') = ?
-      ORDER BY captured_at DESC
-      LIMIT 1
+      WHERE account_id = ? AND date(captured_at, 'localtime') BETWEEN ? AND ?
+      ORDER BY captured_at, id
     `
     )
-    .get(account.id, day);
-  const followerSnapshot = db
-    .prepare(
-      `
-      SELECT *
-      FROM account_snapshots
-      WHERE account_id = ?
-        AND date(captured_at, 'localtime') = ?
-        AND follower_count IS NOT NULL
-        AND follower_count_status = 'available'
-      ORDER BY captured_at DESC
-      LIMIT 1
-    `
-    )
-    .get(account.id, day);
-
-  const totals = db
+    .all(account.id, firstDay, lastDay);
+  const metricSeeds = db
     .prepare(
       `
       SELECT
-        COUNT(DISTINCT v.id) AS video_count,
-        CASE
-          WHEN SUM(CASE WHEN latest.like_count_status = 'failed' THEN 1 ELSE 0 END) > 0 THEN NULL
-          ELSE SUM(CASE WHEN latest.like_count IS NOT NULL THEN latest.like_count ELSE 0 END)
-        END AS like_total,
-        CASE
-          WHEN SUM(CASE WHEN latest.comment_count_status = 'failed' THEN 1 ELSE 0 END) > 0 THEN NULL
-          ELSE SUM(CASE WHEN latest.comment_count IS NOT NULL THEN latest.comment_count ELSE 0 END)
-        END AS comment_total,
-        CASE
-          WHEN SUM(CASE WHEN latest.favorite_count_status = 'failed' THEN 1 ELSE 0 END) > 0 THEN NULL
-          ELSE SUM(CASE WHEN latest.favorite_count IS NOT NULL THEN latest.favorite_count ELSE 0 END)
-        END AS favorite_total
+        v.id AS video_id,
+        (SELECT like_count FROM video_snapshots WHERE video_id = v.id AND date(captured_at, 'localtime') < ? AND like_count_status = 'available' AND like_count IS NOT NULL ORDER BY captured_at DESC, id DESC LIMIT 1) AS like_count,
+        (SELECT comment_count FROM video_snapshots WHERE video_id = v.id AND date(captured_at, 'localtime') < ? AND comment_count_status = 'available' AND comment_count IS NOT NULL ORDER BY captured_at DESC, id DESC LIMIT 1) AS comment_count,
+        (SELECT favorite_count FROM video_snapshots WHERE video_id = v.id AND date(captured_at, 'localtime') < ? AND favorite_count_status = 'available' AND favorite_count IS NOT NULL ORDER BY captured_at DESC, id DESC LIMIT 1) AS favorite_count
       FROM videos v
-      LEFT JOIN video_snapshots latest ON latest.id = (
-        SELECT id
-        FROM video_snapshots
-        WHERE video_id = v.id AND date(captured_at, 'localtime') = ?
-        ORDER BY captured_at DESC
-        LIMIT 1
+      WHERE v.account_id = ? AND EXISTS (
+        SELECT 1 FROM video_snapshots
+        WHERE video_id = v.id AND date(captured_at, 'localtime') < ?
       )
-      WHERE v.account_id = ?
-        AND EXISTS (
-          SELECT 1 FROM video_snapshots vs
-          WHERE vs.video_id = v.id AND date(vs.captured_at, 'localtime') = ?
-        )
     `
     )
-    .get(day, account.id, day);
-
-  const videoCount = totals.video_count || 0;
-
-  return {
-    day,
-    captured_at: latestSnapshot?.captured_at || getDailyVideoCapturedAt(account.id, day),
-    account_id: account.id,
-    account_name: account.display_name,
-    platform_name: account.platform_name,
-    follower_count: followerSnapshot?.follower_count ?? null,
-    follower_count_status: followerSnapshot?.follower_count_status || latestSnapshot?.follower_count_status || "not_public",
-    video_count: videoCount,
-    like_total: videoCount === 0 ? 0 : totals.like_total,
-    comment_total: videoCount === 0 ? 0 : totals.comment_total,
-    favorite_total: videoCount === 0 ? 0 : totals.favorite_total
-  };
-}
-
-function getDailyVideoCapturedAt(accountId, day) {
-  const row = db
+    .all(firstDay, firstDay, firstDay, account.id, firstDay);
+  const videoSnapshots = db
     .prepare(
       `
-      SELECT MAX(vs.captured_at) AS captured_at
+      SELECT vs.*, date(vs.captured_at, 'localtime') AS day
       FROM video_snapshots vs
       JOIN videos v ON v.id = vs.video_id
-      WHERE v.account_id = ? AND date(vs.captured_at, 'localtime') = ?
+      WHERE v.account_id = ? AND date(vs.captured_at, 'localtime') BETWEEN ? AND ?
+      ORDER BY vs.captured_at, vs.id
     `
     )
-    .get(accountId, day);
-  return row?.captured_at || null;
+    .all(account.id, firstDay, lastDay);
+
+  const accountByDay = new Map();
+  for (const snapshot of accountSnapshots) {
+    const daily = accountByDay.get(snapshot.day) || {};
+    daily.latest = snapshot;
+    if (snapshot.follower_count_status === "available" && snapshot.follower_count != null) {
+      daily.follower = snapshot;
+    }
+    accountByDay.set(snapshot.day, daily);
+  }
+
+  const seenVideos = new Set();
+  const metricStates = {
+    like: createDailyMetricState("like_count"),
+    comment: createDailyMetricState("comment_count"),
+    favorite: createDailyMetricState("favorite_count")
+  };
+  for (const seed of metricSeeds) {
+    seenVideos.add(seed.video_id);
+    for (const state of Object.values(metricStates)) {
+      if (seed[state.column] != null) state.values.set(seed.video_id, seed[state.column]);
+    }
+  }
+  let videoIndex = 0;
+  return days.map((day, dayIndex) => {
+    let latestVideoCapturedAt = null;
+    while (videoIndex < videoSnapshots.length && videoSnapshots[videoIndex].day <= day) {
+      const snapshot = videoSnapshots[videoIndex];
+      seenVideos.add(snapshot.video_id);
+      if (snapshot.day === day) latestVideoCapturedAt = snapshot.captured_at;
+      for (const state of Object.values(metricStates)) updateDailyMetricState(state, snapshot);
+      videoIndex += 1;
+    }
+
+    const dailyAccount = accountByDay.get(day) || {};
+    const row = {
+      day,
+      captured_at: dailyAccount.latest?.captured_at || latestVideoCapturedAt,
+      account_id: account.id,
+      account_name: account.display_name,
+      platform_name: account.platform_name,
+      follower_count: dailyAccount.follower?.follower_count ?? null,
+      follower_count_status:
+        dailyAccount.follower?.follower_count_status || dailyAccount.latest?.follower_count_status || "not_public",
+      video_count: seenVideos.size,
+      like_total: sumMetricValues(metricStates.like.values),
+      comment_total: sumMetricValues(metricStates.comment.values),
+      favorite_total: sumMetricValues(metricStates.favorite.values),
+      like_delta: dailyMetricDelta(metricStates.like, dayIndex),
+      comment_delta: dailyMetricDelta(metricStates.comment, dayIndex),
+      favorite_delta: dailyMetricDelta(metricStates.favorite, dayIndex)
+    };
+    for (const state of Object.values(metricStates)) {
+      state.comparableVideoIds = new Set(state.values.keys());
+      state.delta = 0;
+    }
+    return row;
+  });
+}
+
+function createDailyMetricState(column) {
+  return { column, values: new Map(), comparableVideoIds: null, delta: 0 };
+}
+
+function updateDailyMetricState(state, snapshot) {
+  if (snapshot[`${state.column}_status`] !== "available" || snapshot[state.column] == null) return;
+  const previousValue = state.values.get(snapshot.video_id);
+  if (state.comparableVideoIds?.has(snapshot.video_id)) {
+    state.delta += snapshot[state.column] - previousValue;
+  }
+  state.values.set(snapshot.video_id, snapshot[state.column]);
+}
+
+function sumMetricValues(values) {
+  if (!values.size) return null;
+  return [...values.values()].reduce((total, value) => total + value, 0);
+}
+
+function dailyMetricDelta(state, dayIndex) {
+  if (dayIndex === 0 || !state.comparableVideoIds?.size) return null;
+  return state.delta;
 }
 
 export function exportDailyChangesCsv(filters = {}) {
@@ -1006,28 +1158,44 @@ export function computeWeeklySummaries(date = new Date()) {
     const videoDelta = db
       .prepare(
         `
+        WITH snapshots AS (
+          SELECT vs.*
+          FROM video_snapshots vs
+          JOIN videos v ON v.id = vs.video_id
+          WHERE v.account_id = ? AND vs.captured_at >= ? AND vs.captured_at <= ?
+        ),
+        metric_points AS (
+          SELECT video_id, 'like' AS metric, like_count AS value, captured_at, id
+          FROM snapshots WHERE like_count_status = 'available' AND like_count IS NOT NULL
+          UNION ALL
+          SELECT video_id, 'comment', comment_count, captured_at, id
+          FROM snapshots WHERE comment_count_status = 'available' AND comment_count IS NOT NULL
+          UNION ALL
+          SELECT video_id, 'favorite', favorite_count, captured_at, id
+          FROM snapshots WHERE favorite_count_status = 'available' AND favorite_count IS NOT NULL
+        ),
+        ranked AS (
+          SELECT *,
+            ROW_NUMBER() OVER (PARTITION BY video_id, metric ORDER BY captured_at, id) AS oldest_rank,
+            ROW_NUMBER() OVER (PARTITION BY video_id, metric ORDER BY captured_at DESC, id DESC) AS newest_rank
+          FROM metric_points
+        ),
+        metric_values AS (
+          SELECT video_id, metric,
+            MAX(CASE WHEN oldest_rank = 1 THEN value END) AS oldest_value,
+            MAX(CASE WHEN newest_rank = 1 THEN value END) AS newest_value
+          FROM ranked
+          GROUP BY video_id, metric
+        )
         SELECT
-          COUNT(newest.id) AS video_snapshot_count,
-          SUM(CASE WHEN newest.like_count IS NOT NULL AND oldest.like_count IS NOT NULL THEN newest.like_count - oldest.like_count ELSE 0 END) AS like_delta,
-          SUM(CASE WHEN newest.comment_count IS NOT NULL AND oldest.comment_count IS NOT NULL THEN newest.comment_count - oldest.comment_count ELSE 0 END) AS comment_delta,
-          SUM(CASE WHEN newest.favorite_count IS NOT NULL AND oldest.favorite_count IS NOT NULL THEN newest.favorite_count - oldest.favorite_count ELSE 0 END) AS favorite_delta
-        FROM videos v
-        LEFT JOIN video_snapshots oldest ON oldest.id = (
-          SELECT id FROM video_snapshots
-          WHERE video_id = v.id AND captured_at >= ? AND captured_at <= ?
-          ORDER BY captured_at ASC
-          LIMIT 1
-        )
-        LEFT JOIN video_snapshots newest ON newest.id = (
-          SELECT id FROM video_snapshots
-          WHERE video_id = v.id AND captured_at >= ? AND captured_at <= ?
-          ORDER BY captured_at DESC
-          LIMIT 1
-        )
-        WHERE v.account_id = ?
+          COUNT(DISTINCT video_id) AS video_snapshot_count,
+          SUM(CASE WHEN metric = 'like' THEN newest_value - oldest_value ELSE 0 END) AS like_delta,
+          SUM(CASE WHEN metric = 'comment' THEN newest_value - oldest_value ELSE 0 END) AS comment_delta,
+          SUM(CASE WHEN metric = 'favorite' THEN newest_value - oldest_value ELSE 0 END) AS favorite_delta
+        FROM metric_values
       `
     )
-      .get(weekStart, weekEnd, weekStart, weekEnd, account.id);
+      .get(account.id, weekStart, weekEnd);
 
     if (snapshots.length === 0 && !videoDelta.video_snapshot_count) {
       db.prepare("DELETE FROM weekly_summaries WHERE account_id = ? AND week_start = ? AND week_end = ?").run(
@@ -1054,6 +1222,12 @@ export function computeWeeklySummaries(date = new Date()) {
         data_status = excluded.data_status,
         notes = excluded.notes,
         updated_at = CURRENT_TIMESTAMP
+      WHERE weekly_summaries.follower_delta IS NOT excluded.follower_delta
+         OR weekly_summaries.video_like_delta IS NOT excluded.video_like_delta
+         OR weekly_summaries.video_comment_delta IS NOT excluded.video_comment_delta
+         OR weekly_summaries.video_favorite_delta IS NOT excluded.video_favorite_delta
+         OR weekly_summaries.data_status IS NOT excluded.data_status
+         OR weekly_summaries.notes IS NOT excluded.notes
     `
     ).run(
       account.id,
@@ -1074,6 +1248,7 @@ export function listWeeklySummaries(limit = 80) {
   return db
     .prepare(
       `
+      WITH ${latestVideoMetricsCte}
       SELECT
         ws.*,
         a.display_name,
@@ -1114,72 +1289,42 @@ export function listWeeklySummaries(limit = 80) {
         (
           SELECT COALESCE(SUM(vs.like_count), 0)
           FROM videos v
-          LEFT JOIN video_snapshots vs ON vs.id = (
-            SELECT id FROM video_snapshots
-            WHERE video_id = v.id
-            ORDER BY captured_at DESC
-            LIMIT 1
-          )
+          LEFT JOIN latest_video_metrics vs ON vs.video_id = v.id
           WHERE v.account_id = ws.account_id
             AND date(v.published_at) BETWEEN date(ws.week_start) AND date(ws.week_end)
         ) AS current_published_like_total,
         (
           SELECT COALESCE(SUM(vs.like_count), 0)
           FROM videos v
-          LEFT JOIN video_snapshots vs ON vs.id = (
-            SELECT id FROM video_snapshots
-            WHERE video_id = v.id
-            ORDER BY captured_at DESC
-            LIMIT 1
-          )
+          LEFT JOIN latest_video_metrics vs ON vs.video_id = v.id
           WHERE v.account_id = ws.account_id
             AND date(v.published_at) BETWEEN date(ws.week_start, '-7 days') AND date(ws.week_end, '-7 days')
         ) AS previous_published_like_total,
         (
           SELECT COALESCE(SUM(vs.comment_count), 0)
           FROM videos v
-          LEFT JOIN video_snapshots vs ON vs.id = (
-            SELECT id FROM video_snapshots
-            WHERE video_id = v.id
-            ORDER BY captured_at DESC
-            LIMIT 1
-          )
+          LEFT JOIN latest_video_metrics vs ON vs.video_id = v.id
           WHERE v.account_id = ws.account_id
             AND date(v.published_at) BETWEEN date(ws.week_start) AND date(ws.week_end)
         ) AS current_published_comment_total,
         (
           SELECT COALESCE(SUM(vs.comment_count), 0)
           FROM videos v
-          LEFT JOIN video_snapshots vs ON vs.id = (
-            SELECT id FROM video_snapshots
-            WHERE video_id = v.id
-            ORDER BY captured_at DESC
-            LIMIT 1
-          )
+          LEFT JOIN latest_video_metrics vs ON vs.video_id = v.id
           WHERE v.account_id = ws.account_id
             AND date(v.published_at) BETWEEN date(ws.week_start, '-7 days') AND date(ws.week_end, '-7 days')
         ) AS previous_published_comment_total,
         (
           SELECT COALESCE(SUM(vs.favorite_count), 0)
           FROM videos v
-          LEFT JOIN video_snapshots vs ON vs.id = (
-            SELECT id FROM video_snapshots
-            WHERE video_id = v.id
-            ORDER BY captured_at DESC
-            LIMIT 1
-          )
+          LEFT JOIN latest_video_metrics vs ON vs.video_id = v.id
           WHERE v.account_id = ws.account_id
             AND date(v.published_at) BETWEEN date(ws.week_start) AND date(ws.week_end)
         ) AS current_published_favorite_total,
         (
           SELECT COALESCE(SUM(vs.favorite_count), 0)
           FROM videos v
-          LEFT JOIN video_snapshots vs ON vs.id = (
-            SELECT id FROM video_snapshots
-            WHERE video_id = v.id
-            ORDER BY captured_at DESC
-            LIMIT 1
-          )
+          LEFT JOIN latest_video_metrics vs ON vs.video_id = v.id
           WHERE v.account_id = ws.account_id
             AND date(v.published_at) BETWEEN date(ws.week_start, '-7 days') AND date(ws.week_end, '-7 days')
         ) AS previous_published_favorite_total

@@ -2,11 +2,14 @@ import { mkdirSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { DatabaseSync } from "node:sqlite";
+import { FOLLOWER_ONLY_CAPTURE_RESULT } from "../utils/captureStatus.js";
+import { isImplausibleMetricChange, VIDEO_METRICS } from "../utils/dataQuality.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const rootDir = path.resolve(__dirname, "../../..");
 const dataDir = process.env.DATA_DIR || path.join(rootDir, "data");
 const dbPath = process.env.SQLITE_PATH || path.join(dataDir, "app.sqlite");
+const DATA_INTEGRITY_MIGRATION = "2026-07-18-data-integrity-v2";
 
 mkdirSync(dataDir, { recursive: true });
 
@@ -133,6 +136,22 @@ export function initDatabase() {
       updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
       UNIQUE(account_id, week_start, week_end)
     );
+
+    CREATE TABLE IF NOT EXISTS schema_migrations (
+      id TEXT PRIMARY KEY,
+      applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE TABLE IF NOT EXISTS video_association_quarantine (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      migration_id TEXT NOT NULL,
+      video_id INTEGER NOT NULL,
+      account_id INTEGER NOT NULL,
+      video_url TEXT NOT NULL,
+      video_json TEXT NOT NULL,
+      snapshots_json TEXT NOT NULL,
+      quarantined_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    );
   `);
 
   const insertPlatform = db.prepare(`
@@ -144,6 +163,9 @@ export function initDatabase() {
   ensureColumn("accounts", "preferred_capture_time", "TEXT NOT NULL DEFAULT '09:00'");
   ensureColumn("accounts", "capture_video_limit", "INTEGER NOT NULL DEFAULT 10");
   ensureColumn("accounts", "like_alert_threshold", "INTEGER NOT NULL DEFAULT 0");
+  const repairs = runDataIntegrityMigration();
+  createLookupIndexes();
+  return repairs;
 }
 
 export function getDbPath() {
@@ -155,4 +177,258 @@ function ensureColumn(table, column, definition) {
   if (!columns.some((item) => item.name === column)) {
     db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
   }
+}
+
+function removeDuplicateVideoAssociations() {
+  const rows = db
+    .prepare(
+      `
+      SELECT v.id, v.video_url, v.first_seen_at, COUNT(vs.id) AS snapshot_count
+      FROM videos v
+      LEFT JOIN video_snapshots vs ON vs.video_id = v.id
+      GROUP BY v.id
+      ORDER BY v.video_url, datetime(v.first_seen_at) ASC, v.id ASC
+    `
+    )
+    .all();
+  const seenVideoUrls = new Set();
+  const duplicateIds = [];
+  for (const row of rows) {
+    if (!seenVideoUrls.has(row.video_url)) {
+      seenVideoUrls.add(row.video_url);
+    } else {
+      duplicateIds.push(row.id);
+    }
+  }
+  if (!duplicateIds.length) return 0;
+
+  const deleteSnapshots = db.prepare("DELETE FROM video_snapshots WHERE video_id = ?");
+  const deleteVideo = db.prepare("DELETE FROM videos WHERE id = ?");
+  const findVideo = db.prepare("SELECT * FROM videos WHERE id = ?");
+  const findSnapshots = db.prepare("SELECT * FROM video_snapshots WHERE video_id = ? ORDER BY captured_at, id");
+  const quarantineVideo = db.prepare(
+    `INSERT INTO video_association_quarantine (
+       migration_id, video_id, account_id, video_url, video_json, snapshots_json
+     ) VALUES (?, ?, ?, ?, ?, ?)`
+  );
+  for (const videoId of duplicateIds) {
+    const video = findVideo.get(videoId);
+    quarantineVideo.run(
+      DATA_INTEGRITY_MIGRATION,
+      videoId,
+      video.account_id,
+      video.video_url,
+      JSON.stringify(video),
+      JSON.stringify(findSnapshots.all(videoId))
+    );
+    deleteSnapshots.run(videoId);
+    deleteVideo.run(videoId);
+  }
+  return duplicateIds.length;
+}
+
+function quarantineHistoricalMetricDrops() {
+  let quarantined = 0;
+  const lastFollowerByAccount = new Map();
+  const pendingFollowerByAccount = new Map();
+  const accountRows = db
+    .prepare(
+      `SELECT id, account_id, follower_count, follower_count_status
+       FROM account_snapshots
+       WHERE follower_count_status IN ('available', 'failed') AND follower_count IS NOT NULL
+       ORDER BY account_id, captured_at, id`
+    )
+    .all();
+  const quarantineFollower = db.prepare(
+    "UPDATE account_snapshots SET follower_count_status = 'failed' WHERE id = ?"
+  );
+  const restoreFollower = db.prepare(
+    "UPDATE account_snapshots SET follower_count_status = 'available' WHERE id = ?"
+  );
+  for (const row of accountRows) {
+    const stable = lastFollowerByAccount.get(row.account_id);
+    const pending = pendingFollowerByAccount.get(row.account_id);
+    if (shouldQuarantineHistoricalMetric(stable, pending, row.follower_count)) {
+      if (row.follower_count_status !== "failed") {
+        quarantineFollower.run(row.id);
+        quarantined += 1;
+      }
+      pendingFollowerByAccount.set(row.account_id, row.follower_count);
+    } else {
+      if (row.follower_count_status !== "available") {
+        restoreFollower.run(row.id);
+        quarantined += 1;
+      }
+      lastFollowerByAccount.set(row.account_id, row.follower_count);
+      pendingFollowerByAccount.delete(row.account_id);
+    }
+  }
+
+  const videoRows = db
+    .prepare(
+      `SELECT id, video_id,
+         like_count, like_count_status,
+         comment_count, comment_count_status,
+         favorite_count, favorite_count_status
+       FROM video_snapshots
+       ORDER BY video_id, captured_at, id`
+    )
+    .all();
+  const previousByVideoMetric = new Map();
+  const pendingByVideoMetric = new Map();
+  const quarantineStatements = new Map(
+    VIDEO_METRICS.map(({ statusColumn }) => [
+      statusColumn,
+      db.prepare(`UPDATE video_snapshots SET ${statusColumn} = 'failed' WHERE id = ?`)
+    ])
+  );
+  const restoreStatements = new Map(
+    VIDEO_METRICS.map(({ statusColumn }) => [
+      statusColumn,
+      db.prepare(`UPDATE video_snapshots SET ${statusColumn} = 'available' WHERE id = ?`)
+    ])
+  );
+  for (const row of videoRows) {
+    for (const { column, statusColumn } of VIDEO_METRICS) {
+      if (!["available", "failed"].includes(row[statusColumn]) || row[column] == null) continue;
+      const key = `${row.video_id}:${column}`;
+      const stable = previousByVideoMetric.get(key);
+      const pending = pendingByVideoMetric.get(key);
+      if (shouldQuarantineHistoricalMetric(stable, pending, row[column])) {
+        if (row[statusColumn] !== "failed") {
+          quarantineStatements.get(statusColumn).run(row.id);
+          quarantined += 1;
+        }
+        pendingByVideoMetric.set(key, row[column]);
+      } else {
+        if (row[statusColumn] !== "available") {
+          restoreStatements.get(statusColumn).run(row.id);
+          quarantined += 1;
+        }
+        previousByVideoMetric.set(key, row[column]);
+        pendingByVideoMetric.delete(key);
+      }
+    }
+  }
+  return quarantined;
+}
+
+function shouldQuarantineHistoricalMetric(stable, pending, current) {
+  if (!isImplausibleMetricChange(stable, current)) return false;
+  return pending == null || isImplausibleMetricChange(pending, current);
+}
+
+function refreshLatestFollowerCounts() {
+  db.exec(`
+    UPDATE accounts
+    SET latest_follower_count = (
+      SELECT follower_count
+      FROM account_snapshots
+      WHERE account_id = accounts.id
+        AND follower_count_status = 'available'
+        AND follower_count IS NOT NULL
+      ORDER BY captured_at DESC, id DESC
+      LIMIT 1
+    )
+    WHERE EXISTS (
+      SELECT 1
+      FROM account_snapshots
+      WHERE account_id = accounts.id
+        AND follower_count_status = 'available'
+        AND follower_count IS NOT NULL
+    );
+  `);
+}
+
+function reclassifyFollowerOnlyCaptureJobs() {
+  const result = db
+    .prepare(
+      `
+      UPDATE capture_jobs AS job
+      SET status = ?,
+          error_code = COALESCE(error_code, ?),
+          error_message = COALESCE(NULLIF(error_message, ''), ?),
+          updated_at = CURRENT_TIMESTAMP
+      WHERE job.status = 'success'
+        AND EXISTS (
+          SELECT 1 FROM account_snapshots snapshot
+          WHERE snapshot.capture_job_id = job.id
+        )
+        AND NOT EXISTS (
+          SELECT 1 FROM video_snapshots snapshot
+          WHERE snapshot.capture_job_id = job.id
+        )
+        AND EXISTS (
+          SELECT 1 FROM videos video
+          WHERE video.account_id = job.account_id
+        )
+    `
+    )
+    .run(
+      FOLLOWER_ONLY_CAPTURE_RESULT.status,
+      FOLLOWER_ONLY_CAPTURE_RESULT.error_code,
+      FOLLOWER_ONLY_CAPTURE_RESULT.error_message
+    );
+  return result.changes;
+}
+
+function runDataIntegrityMigration() {
+  const emptyResult = {
+    duplicateVideosRemoved: 0,
+    quarantinedMetrics: 0,
+    followerOnlyJobsReclassified: 0
+  };
+  const applied = db.prepare("SELECT 1 FROM schema_migrations WHERE id = ?").get(DATA_INTEGRITY_MIGRATION);
+  if (applied) return emptyResult;
+
+  db.exec("BEGIN IMMEDIATE");
+  try {
+    const repairs = {
+      duplicateVideosRemoved: removeDuplicateVideoAssociations(),
+      quarantinedMetrics: quarantineHistoricalMetricDrops(),
+      followerOnlyJobsReclassified: reclassifyFollowerOnlyCaptureJobs()
+    };
+    refreshLatestFollowerCounts();
+    refreshLatestCollectionStatuses();
+    db.exec("CREATE UNIQUE INDEX IF NOT EXISTS videos_video_url_unique ON videos(video_url);");
+    db.prepare("INSERT INTO schema_migrations (id) VALUES (?)").run(DATA_INTEGRITY_MIGRATION);
+    db.exec("COMMIT");
+    return repairs;
+  } catch (error) {
+    db.exec("ROLLBACK");
+    throw error;
+  }
+}
+
+function createLookupIndexes() {
+  db.exec(`
+    CREATE UNIQUE INDEX IF NOT EXISTS videos_video_url_unique ON videos(video_url);
+    CREATE INDEX IF NOT EXISTS videos_account_id_index ON videos(account_id);
+    CREATE INDEX IF NOT EXISTS account_snapshots_account_time_index
+      ON account_snapshots(account_id, captured_at, id);
+    CREATE INDEX IF NOT EXISTS account_snapshots_job_index ON account_snapshots(capture_job_id);
+    CREATE INDEX IF NOT EXISTS video_snapshots_video_time_index
+      ON video_snapshots(video_id, captured_at, id);
+    CREATE INDEX IF NOT EXISTS video_snapshots_job_index ON video_snapshots(capture_job_id);
+    CREATE INDEX IF NOT EXISTS capture_jobs_account_finished_index
+      ON capture_jobs(account_id, finished_at, id);
+  `);
+}
+
+function refreshLatestCollectionStatuses() {
+  db.exec(`
+    UPDATE accounts
+    SET latest_collect_status = (
+      SELECT status
+      FROM capture_jobs
+      WHERE account_id = accounts.id AND finished_at IS NOT NULL
+      ORDER BY finished_at DESC, id DESC
+      LIMIT 1
+    )
+    WHERE EXISTS (
+      SELECT 1
+      FROM capture_jobs
+      WHERE account_id = accounts.id AND finished_at IS NOT NULL
+    );
+  `);
 }

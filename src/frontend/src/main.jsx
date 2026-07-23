@@ -200,10 +200,18 @@ function App() {
   async function handleUpdateAccount(id, payload) {
     setError("");
     try {
-      await api.updateAccount(id, payload);
-      await refresh();
+      const updatedAccount = await api.updateAccount(id, payload);
+      setAccounts((current) => current.map((account) => {
+        if (account.id !== id) return account;
+        const savedFields = Object.fromEntries(
+          Object.keys(payload).map((field) => [field, updatedAccount?.[field] ?? payload[field]])
+        );
+        return { ...account, ...savedFields };
+      }));
+      return updatedAccount;
     } catch (err) {
       setError(err.message);
+      throw err;
     }
   }
 
@@ -654,45 +662,7 @@ function AccountTable({ accounts, onCapture, onUpdate, onDelete, onClearData, ca
                 </div>
               </td>
               <td><Badge>{account.platform_name}</Badge></td>
-              <td>
-                <select
-                  className="table-control"
-                  value={account.capture_frequency}
-                  onChange={(event) => onUpdate(account.id, { capture_frequency: event.target.value })}
-                >
-                  <FrequencyOptions />
-                </select>
-              </td>
-              <td>
-                <input
-                  className="table-control"
-                  type="time"
-                  value={account.preferred_capture_time || "09:00"}
-                  disabled={!["daily", "weekly"].includes(account.capture_frequency)}
-                  onChange={(event) => onUpdate(account.id, { preferred_capture_time: event.target.value })}
-                />
-              </td>
-              <td>
-                <input
-                  className="table-control compact-number"
-                  type="number"
-                  min="1"
-                  max="100"
-                  step="1"
-                  value={account.capture_video_limit || 10}
-                  onChange={(event) => onUpdate(account.id, { capture_video_limit: event.target.value })}
-                />
-              </td>
-              <td>
-                <input
-                  className="table-control"
-                  type="number"
-                  min="0"
-                  step="1"
-                  value={account.like_alert_threshold || 0}
-                  onChange={(event) => onUpdate(account.id, { like_alert_threshold: event.target.value })}
-                />
-              </td>
+              <AccountSettingsControls account={account} onUpdate={onUpdate} />
               <td>{formatNullable(account.latest_follower_count)}</td>
               <td><StatusPill status={account.latest_collect_status} /></td>
               <td>{formatDate(account.last_captured_at)}</td>
@@ -730,6 +700,128 @@ function AccountTable({ accounts, onCapture, onUpdate, onDelete, onClearData, ca
     </div>
   );
 }
+
+const AccountSettingsControls = React.memo(function AccountSettingsControls({ account, onUpdate }) {
+  const [draft, setDraft] = useState({});
+
+  function updateDraft(field, value) {
+    setDraft((current) => ({ ...current, [field]: value }));
+  }
+
+  function clearDraft(field, expectedValue) {
+    setDraft((current) => {
+      if (String(current[field]) !== String(expectedValue)) return current;
+      const next = { ...current };
+      delete next[field];
+      return next;
+    });
+  }
+
+  async function persistField(field, value, fallback) {
+    if (String(value) === String(account[field] ?? fallback)) {
+      clearDraft(field, value);
+      return;
+    }
+    try {
+      await onUpdate(account.id, { [field]: value });
+    } catch {
+      // App-level handler displays the save error.
+    } finally {
+      clearDraft(field, value);
+    }
+  }
+
+  function changeFrequency(event) {
+    const value = event.target.value;
+    updateDraft("capture_frequency", value);
+    void persistField("capture_frequency", value, "daily");
+  }
+
+  function commitCaptureTime() {
+    const value = draft.preferred_capture_time ?? account.preferred_capture_time ?? "09:00";
+    if (!/^([01]\d|2[0-3]):[0-5]\d$/.test(value)) {
+      clearDraft("preferred_capture_time", value);
+      return;
+    }
+    void persistField("preferred_capture_time", value, "09:00");
+  }
+
+  function commitVideoLimit() {
+    const rawValue = draft.capture_video_limit ?? account.capture_video_limit ?? 10;
+    const parsed = Number(rawValue);
+    if (!Number.isFinite(parsed)) {
+      clearDraft("capture_video_limit", rawValue);
+      return;
+    }
+    const value = Math.min(100, Math.max(1, Math.round(parsed)));
+    updateDraft("capture_video_limit", String(value));
+    void persistField("capture_video_limit", value, 10);
+  }
+
+  function commitLikeThreshold() {
+    const rawValue = draft.like_alert_threshold ?? account.like_alert_threshold ?? 0;
+    const parsed = Number(rawValue);
+    if (!Number.isFinite(parsed)) {
+      clearDraft("like_alert_threshold", rawValue);
+      return;
+    }
+    const value = Math.max(0, Math.round(parsed));
+    updateDraft("like_alert_threshold", String(value));
+    void persistField("like_alert_threshold", value, 0);
+  }
+
+  function blurOnEnter(event) {
+    if (event.key === "Enter") event.currentTarget.blur();
+  }
+
+  const frequency = draft.capture_frequency ?? account.capture_frequency ?? "daily";
+
+  return (
+    <>
+      <td>
+        <select className="table-control" value={frequency} onChange={changeFrequency}>
+          <FrequencyOptions />
+        </select>
+      </td>
+      <td>
+        <input
+          className="table-control"
+          type="time"
+          value={draft.preferred_capture_time ?? account.preferred_capture_time ?? "09:00"}
+          disabled={!["daily", "weekly"].includes(frequency)}
+          onChange={(event) => updateDraft("preferred_capture_time", event.target.value)}
+          onBlur={commitCaptureTime}
+          onKeyDown={blurOnEnter}
+        />
+      </td>
+      <td>
+        <input
+          className="table-control compact-number"
+          type="number"
+          min="1"
+          max="100"
+          step="1"
+          value={draft.capture_video_limit ?? String(account.capture_video_limit ?? 10)}
+          onChange={(event) => updateDraft("capture_video_limit", event.target.value)}
+          onBlur={commitVideoLimit}
+          onKeyDown={blurOnEnter}
+        />
+      </td>
+      <td>
+        <input
+          className="table-control"
+          type="number"
+          min="0"
+          step="1"
+          value={draft.like_alert_threshold ?? String(account.like_alert_threshold ?? 0)}
+          onChange={(event) => updateDraft("like_alert_threshold", event.target.value)}
+          onBlur={commitLikeThreshold}
+          onKeyDown={blurOnEnter}
+        />
+      </td>
+    </>
+  );
+});
 
 function Videos({ videos, accounts, filters, resolvedFilters, onApplyFilters }) {
   const [draft, setDraft] = useState(filters);

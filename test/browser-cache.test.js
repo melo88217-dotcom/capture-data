@@ -3,9 +3,13 @@ import { mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
+import { setImmediate, setTimeout as delay } from "node:timers/promises";
 
 import { cleanBrowserCache, getBrowserCacheStatus } from "../src/backend/services/browserCache.js";
-import { isBrowserOperationRunning, trackBrowserOperation } from "../src/backend/services/browserMaintenance.js";
+import {
+  isBrowserOperationRunning,
+  runExclusiveBrowserOperation
+} from "../src/backend/services/browserMaintenance.js";
 
 async function makeFile(root, relativePath, size) {
   const target = path.join(root, relativePath);
@@ -69,10 +73,86 @@ test("browser operation remains active until the underlying collector settles", 
   const collector = new Promise((resolve) => {
     finish = resolve;
   });
-  const tracked = trackBrowserOperation(collector);
+  const tracked = runExclusiveBrowserOperation(() => collector);
 
   assert.equal(isBrowserOperationRunning(), true);
   finish();
   await tracked;
+  assert.equal(isBrowserOperationRunning(), false);
+});
+
+test("browser operations are serialized so collectors cannot navigate the shared page concurrently", async () => {
+  const events = [];
+  let releaseFirst;
+  const firstGate = new Promise((resolve) => {
+    releaseFirst = resolve;
+  });
+
+  const first = runExclusiveBrowserOperation(async () => {
+    events.push("first:start");
+    await firstGate;
+    events.push("first:end");
+  });
+  const second = runExclusiveBrowserOperation(async () => {
+    events.push("second:start");
+    events.push("second:end");
+  });
+
+  await setImmediate();
+  assert.deepEqual(events, ["first:start"]);
+
+  releaseFirst();
+  await Promise.all([first, second]);
+  assert.deepEqual(events, ["first:start", "first:end", "second:start", "second:end"]);
+});
+
+test("queued wait does not consume runtime timeout and timeout keeps the browser slot locked", async () => {
+  let releaseFirst;
+  const firstGate = new Promise((resolve) => {
+    releaseFirst = resolve;
+  });
+  let releaseSecond;
+  const secondGate = new Promise((resolve) => {
+    releaseSecond = resolve;
+  });
+  let secondStarted = false;
+  let thirdStarted = false;
+
+  const first = runExclusiveBrowserOperation(() => firstGate);
+  const second = runExclusiveBrowserOperation(
+    () => {
+      secondStarted = true;
+      return secondGate;
+    },
+    (operation) => Promise.race([
+      operation,
+      delay(20).then(() => {
+        throw new Error("collector timeout");
+      })
+    ])
+  );
+  const secondOutcome = second.then(
+    () => ({ error: null }),
+    (error) => ({ error })
+  );
+
+  await delay(40);
+  assert.equal(secondStarted, false);
+  releaseFirst();
+  await first;
+  const outcome = await secondOutcome;
+  assert.match(outcome.error.message, /collector timeout/);
+  assert.equal(secondStarted, true);
+  assert.equal(isBrowserOperationRunning(), true);
+
+  const third = runExclusiveBrowserOperation(() => {
+    thirdStarted = true;
+  });
+  await setImmediate();
+  assert.equal(thirdStarted, false);
+
+  releaseSecond();
+  await third;
+  assert.equal(thirdStarted, true);
   assert.equal(isBrowserOperationRunning(), false);
 });
