@@ -1,32 +1,65 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { chromium } from "playwright";
 
 import {
   buildDouyinProfileVideos,
   classifyCollectionStatus,
-  extractFollower
+  extractFollower,
+  getProfileFollower
 } from "../src/backend/collectors/shared/browserCollector.js";
 
-test("extractFollower reads the account header follower metric", () => {
-  const result = extractFollower("关注 81 粉丝 1.0万 获赞 5.8万 抖音号：1386882638");
+test("extractFollower reads a follower metric item that keeps its label and value together", () => {
+  const result = extractFollower(["1.0万 粉丝"]);
 
   assert.equal(result.status, "available");
   assert.equal(result.value, 10000);
   assert.equal(result.raw, "1.0万");
 });
 
-test("extractFollower does not treat a Douyin id as follower count", () => {
-  const result = extractFollower("关注 粉丝 获赞 抖音号：1386882638");
+test("extractFollower does not treat unrelated profile text as a follower metric", () => {
+  const result = extractFollower(["抖音号：1386882638"]);
 
   assert.equal(result.status, "not_public");
   assert.equal(result.value, null);
 });
 
-test("extractFollower accepts a metric rendered before the follower label", () => {
-  const result = extractFollower("81 关注 1.0万 粉丝 5.8万 获赞");
+test("extractFollower accepts a metric rendered after the follower label", () => {
+  const result = extractFollower(["粉丝 1.0万"]);
 
   assert.equal(result.status, "available");
   assert.equal(result.value, 10000);
+});
+
+test("extractFollower rejects incomplete header fragments and conflicting metric items", () => {
+  assert.equal(extractFollower(["关注 20 粉丝"]).value, null);
+  assert.equal(extractFollower(["粉丝 1.1万 获赞"]).value, null);
+
+  const conflicting = extractFollower(["1.0万 粉丝", "5.8万 粉丝"]);
+  assert.equal(conflicting.status, "unknown");
+  assert.equal(conflicting.value, null);
+});
+
+test("getProfileFollower reads only the DOM item paired with the follower label", async (t) => {
+  const browser = await chromium.launch({ headless: true });
+  t.after(() => browser.close());
+  const page = await browser.newPage();
+  await page.setContent(`
+    <main><span>5</span><span>粉丝</span></main>
+    <header>
+      <h1>测试账号</h1>
+      <div><span>20</span><span>关注</span></div>
+      <div><span>粉丝</span><span>1802</span></div>
+      <div><span>1.0万</span><span>获赞</span></div>
+      <p>关注 20 粉丝 1802 获赞 1.0万</p>
+    </header>
+  `);
+
+  const result = await getProfileFollower(page);
+
+  assert.equal(result.status, "available");
+  assert.equal(result.value, 1802);
+  assert.equal(result.raw, "1802");
 });
 
 test("a follower-only capture is partial instead of a successful zero-video capture", () => {

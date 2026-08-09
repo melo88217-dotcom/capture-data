@@ -10,6 +10,7 @@ const rootDir = path.resolve(__dirname, "../../..");
 const dataDir = process.env.DATA_DIR || path.join(rootDir, "data");
 const dbPath = process.env.SQLITE_PATH || path.join(dataDir, "app.sqlite");
 const DATA_INTEGRITY_MIGRATION = "2026-07-18-data-integrity-v2";
+const FOLLOWER_OUTLIER_MIGRATION = "2026-07-29-follower-outlier-repair-v1";
 
 mkdirSync(dataDir, { recursive: true });
 
@@ -163,9 +164,13 @@ export function initDatabase() {
   ensureColumn("accounts", "preferred_capture_time", "TEXT NOT NULL DEFAULT '09:00'");
   ensureColumn("accounts", "capture_video_limit", "INTEGER NOT NULL DEFAULT 10");
   ensureColumn("accounts", "like_alert_threshold", "INTEGER NOT NULL DEFAULT 0");
-  const repairs = runDataIntegrityMigration();
+  const integrityRepairs = runDataIntegrityMigration();
+  const followerOutliersQuarantined = runFollowerOutlierMigration();
   createLookupIndexes();
-  return repairs;
+  return {
+    ...integrityRepairs,
+    quarantinedMetrics: integrityRepairs.quarantinedMetrics + followerOutliersQuarantined
+  };
 }
 
 export function getDbPath() {
@@ -398,6 +403,99 @@ function runDataIntegrityMigration() {
     db.exec("ROLLBACK");
     throw error;
   }
+}
+
+function runFollowerOutlierMigration() {
+  const applied = db.prepare("SELECT 1 FROM schema_migrations WHERE id = ?").get(FOLLOWER_OUTLIER_MIGRATION);
+  if (applied) return 0;
+
+  db.exec("BEGIN IMMEDIATE");
+  try {
+    const changed = reconcileBoundedFollowerOutliers();
+    refreshLatestFollowerCounts();
+    db.prepare("INSERT INTO schema_migrations (id) VALUES (?)").run(FOLLOWER_OUTLIER_MIGRATION);
+    db.exec("COMMIT");
+    return changed;
+  } catch (error) {
+    db.exec("ROLLBACK");
+    throw error;
+  }
+}
+
+function reconcileBoundedFollowerOutliers() {
+  const rows = db
+    .prepare(
+      `SELECT id, account_id, follower_count, follower_count_status
+       FROM account_snapshots
+       WHERE follower_count_status IN ('available', 'failed') AND follower_count IS NOT NULL
+       ORDER BY account_id, captured_at, id`
+    )
+    .all();
+  const markFailed = db.prepare("UPDATE account_snapshots SET follower_count_status = 'failed' WHERE id = ?");
+  const restoreAvailable = db.prepare("UPDATE account_snapshots SET follower_count_status = 'available' WHERE id = ?");
+  let changed = 0;
+  let start = 0;
+
+  while (start < rows.length) {
+    let end = start + 1;
+    while (end < rows.length && rows[end].account_id === rows[start].account_id) end += 1;
+    const accountRows = rows.slice(start, end);
+
+    for (let index = 0; index < accountRows.length; index += 1) {
+      const row = accountRows[index];
+      if (row.follower_count_status === "available" && isBoundedFollowerOutlier(accountRows, index)) {
+        markFailed.run(row.id);
+        row.follower_count_status = "failed";
+        changed += 1;
+      }
+    }
+
+    for (let index = 0; index < accountRows.length; index += 1) {
+      const row = accountRows[index];
+      if (
+        row.follower_count_status === "failed" &&
+        !isBoundedFollowerOutlier(accountRows, index) &&
+        hasPriorAvailableComparableFollower(accountRows, index)
+      ) {
+        restoreAvailable.run(row.id);
+        row.follower_count_status = "available";
+        changed += 1;
+      }
+    }
+
+    start = end;
+  }
+
+  return changed;
+}
+
+function isBoundedFollowerOutlier(rows, index) {
+  const current = rows[index].follower_count;
+  for (let beforeIndex = index - 1; beforeIndex >= 0; beforeIndex -= 1) {
+    const before = rows[beforeIndex].follower_count;
+    if (!isImplausibleMetricChange(before, current)) continue;
+    for (let afterIndex = index + 1; afterIndex < rows.length; afterIndex += 1) {
+      const after = rows[afterIndex].follower_count;
+      if (
+        isImplausibleMetricChange(after, current) &&
+        !isImplausibleMetricChange(before, after)
+      ) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+function hasPriorAvailableComparableFollower(rows, index) {
+  const current = rows[index].follower_count;
+  for (let priorIndex = index - 1; priorIndex >= 0; priorIndex -= 1) {
+    const prior = rows[priorIndex];
+    if (prior.follower_count_status === "available" && !isImplausibleMetricChange(prior.follower_count, current)) {
+      return true;
+    }
+  }
+  return false;
 }
 
 function createLookupIndexes() {

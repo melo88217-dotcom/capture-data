@@ -101,8 +101,8 @@ export async function collectPublicPage(account, options = {}) {
         screenshot_path: screenshotPath
       });
     }
-    const profileText = await getProfileText(page);
-    const follower = extractFollower(profileText);
+    const profileText = await getBodyText(page);
+    const follower = await getProfileFollower(page);
     const profileUrl = page.url();
     rememberCanonicalProfileUrl(account, profileUrl);
     const profileVideos = await extractDouyinProfileVideos(page, limit);
@@ -133,7 +133,7 @@ export async function collectPublicPage(account, options = {}) {
     return {
       platform: account.platform_code,
       account: {
-        display_name: inferAccountName(profileText, account.display_name),
+        display_name: account.display_name,
         profile_url: profileUrl || account.profile_url,
         follower_count: follower.value,
         follower_count_status: follower.status,
@@ -313,26 +313,18 @@ async function waitForProfileReady(page, limit) {
     const blocked = matchBlockedContent(probe.title, probe.text);
     if (blocked) return blocked;
 
-    const follower = extractFollower(probe.text);
+    const follower = await getProfileFollower(page);
     const videoCount = probe.videoCount;
     bestVideoCount = Math.max(bestVideoCount, videoCount);
 
     if (follower.status === "available" && videoCount >= targetVideoCount) return null;
     if (follower.status === "available" && bestVideoCount > 0 && Date.now() - started >= Math.max(settle, 6000)) return null;
-    if (
-      videoCount >= targetVideoCount &&
-      hasProfileIdentityText(probe.text) &&
-      Date.now() - started >= Math.max(settle, 6000)
-    ) {
-      return null;
-    }
-
     await page.mouse.wheel(0, 900).catch(() => {});
     await page.waitForTimeout(1000);
   }
 
-  const text = await getProfileText(page);
-  const follower = extractFollower(text);
+  const text = await getBodyText(page);
+  const follower = await getProfileFollower(page);
   if (follower.status === "available" || (bestVideoCount > 0 && hasProfileIdentityText(text))) return null;
   return {
     code: "PAGE_RENDER_INCOMPLETE",
@@ -485,66 +477,69 @@ function extractPublishedAt(text) {
   return match ? match[1] : null;
 }
 
-export function extractFollower(text) {
-  const compact = String(text || "").replace(/\s+/g, "");
-  const metricPattern = "([0-9]+(?:\\.[0-9]+)?(?:\\u4e07|w|W|\\u4ebf)?\\+?)";
-  const metricsBeforeLabels = compact.match(
-    new RegExp(`${metricPattern}\\u5173\\u6ce8${metricPattern}\\u7c89\\u4e1d${metricPattern}\\u83b7\\u8d5e`)
-  );
-  if (metricsBeforeLabels) {
-    const parsed = parseMetricLine(metricsBeforeLabels[2]);
-    if (parsed.status === "available") return parsed;
-  }
+export function extractFollower(metricItems) {
+  const values = Array.isArray(metricItems) ? metricItems : [metricItems];
+  const parsed = values
+    .map(extractFollowerMetricItem)
+    .filter((item) => item.status === "available");
+  const distinctValues = new Set(parsed.map((item) => item.value));
 
-  const orderedMetrics = compact.match(
-    new RegExp(`\\u5173\\u6ce8${metricPattern}\\u7c89\\u4e1d${metricPattern}\\u83b7\\u8d5e`)
-  );
-  if (orderedMetrics) {
-    const parsed = parseMetricLine(orderedMetrics[2]);
-    if (parsed.status === "available") return parsed;
-  }
-
-  const anchoredPatterns = [
-    new RegExp(`\\u7c89\\u4e1d${metricPattern}\\u83b7\\u8d5e`),
-    new RegExp(`followers${metricPattern}`, "i")
-  ];
-
-  const beforeLabel = compact.match(/([0-9]+(?:\.[0-9]+)?(?:\u4e07|w|W|\u4ebf)?\+?)\u7c89\u4e1d/i);
-  if (beforeLabel) {
-    const parsed = parseMetricLine(beforeLabel[1]);
-    if (parsed.status === "available") return parsed;
-  }
-
-  for (const pattern of anchoredPatterns) {
-    const match = compact.match(pattern);
-    if (!match) continue;
-    const parsed = parseMetricLine(match[1]);
-    if (parsed.status === "available") return parsed;
-  }
-
-  const lines = String(text || "")
-    .split(/\r?\n/)
-    .map((line) => line.trim())
-    .filter(Boolean);
-  for (const line of lines) {
-    if (!/\u7c89\u4e1d|followers/i.test(line) || /\u6296\u97f3\u53f7/.test(line)) continue;
-    const match = line.match(new RegExp(`(?:\\u7c89\\u4e1d|followers)\\s*${metricPattern}`, "i"));
-    if (!match) continue;
-    const parsed = parseMetricLine(match[1]);
-    if (parsed.status === "available") return parsed;
-  }
-
-  return { value: null, status: "not_public", raw: "" };
+  if (distinctValues.size === 1) return parsed[0];
+  return {
+    value: null,
+    status: parsed.length ? "unknown" : "not_public",
+    raw: ""
+  };
 }
 
-function inferAccountName(text, fallback) {
-  const lines = String(text || "")
-    .split(/\r?\n/)
-    .map((line) => line.trim())
-    .filter(Boolean);
-  const index = lines.findIndex((line) => line === "\u6296\u97f3\u53f7\uff1a" || line.startsWith("\u6296\u97f3\u53f7"));
-  if (index > 0) return lines[index - 1];
-  return fallback;
+function extractFollowerMetricItem(value) {
+  const compact = String(value || "").replace(/\s+/g, "");
+  const metricPattern = "([0-9]+(?:\\.[0-9]+)?(?:\\u4e07|w|W|\\u4ebf)?\\+?)";
+  const metricBeforeLabel = compact.match(new RegExp(`^${metricPattern}(?:\\u7c89\\u4e1d|followers)$`, "i"));
+  const labelBeforeMetric = compact.match(new RegExp(`^(?:\\u7c89\\u4e1d|followers)${metricPattern}$`, "i"));
+  const candidate = metricBeforeLabel?.[1] || labelBeforeMetric?.[1];
+  return candidate ? parseMetricLine(candidate) : { value: null, status: "unknown", raw: "" };
+}
+
+export async function getProfileFollower(page) {
+  const metricItems = await page
+    .evaluate(() => {
+      const metricPattern = "[0-9]+(?:\\.[0-9]+)?(?:万|w|W|亿)?\\+?";
+      const directMetric = new RegExp(`^(?:${metricPattern})(?:粉丝|followers)$|^(?:粉丝|followers)(?:${metricPattern})$`, "i");
+      const normalize = (value) => String(value || "").replace(/\s+/g, "").trim();
+      const getText = (element) => normalize(element.innerText || element.textContent || "");
+      const belongsToProfileHeader = (element) => {
+        let ancestor = element.parentElement;
+        for (
+          let depth = 0;
+          ancestor && ancestor !== document.body && ancestor !== document.documentElement && depth < 6;
+          depth += 1, ancestor = ancestor.parentElement
+        ) {
+          if (ancestor.querySelector("h1")) return true;
+        }
+        return false;
+      };
+      const items = new Set();
+      const elements = Array.from(document.body?.querySelectorAll("*") || []);
+
+      const followerLabels = elements.filter((element) => {
+        const text = getText(element);
+        return /^(?:粉丝|followers)$/i.test(text) && belongsToProfileHeader(element);
+      });
+      for (const label of followerLabels) {
+        let branch = label;
+        for (let depth = 0; depth < 3 && branch.parentElement; depth += 1) {
+          const parent = branch.parentElement;
+          const parentText = getText(parent);
+          if (parentText.length <= 32 && directMetric.test(parentText)) items.add(parentText);
+          branch = parent;
+        }
+      }
+
+      return Array.from(items);
+    })
+    .catch(() => []);
+  return extractFollower(metricItems);
 }
 
 async function checkBlocked(page) {
@@ -568,33 +563,6 @@ async function getProfileReadyProbe(page) {
       videoCount: document.querySelectorAll('a[href*="/video/"]').length
     }))
     .catch(() => ({ title: "", text: "", videoCount: 0 }));
-}
-
-async function getProfileText(page) {
-  const bodyText = await getBodyText(page);
-  const domText = await page
-    .evaluate(() => {
-      const texts = new Set();
-      const clean = (value) => String(value || "").replace(/\s+/g, " ").trim();
-      const bodyContent = clean(document.body?.textContent || "");
-      if (bodyContent) texts.add(bodyContent);
-
-      for (const node of document.querySelectorAll("*")) {
-        const text = clean(node.textContent || "");
-        if (!text || !/粉丝|获赞|关注|followers/i.test(text)) continue;
-
-        const parentText = clean(node.parentElement?.textContent || "");
-        const grandText = clean(node.parentElement?.parentElement?.textContent || "");
-        texts.add(text);
-        if (parentText) texts.add(parentText);
-        if (grandText) texts.add(grandText);
-      }
-
-      return Array.from(texts).join("\n");
-    })
-    .catch(() => "");
-
-  return [bodyText, domText].filter(Boolean).join("\n");
 }
 
 async function getBodyText(page) {

@@ -429,6 +429,21 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
   padding: 8px 4px 0;
 }
 
+.trend-chart-note {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  margin: 7px 0 0;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.trend-chart-dash {
+  width: 24px;
+  border-top: 2px dashed #66736e;
+}
+
 .compact-timeline .timeline-item { padding: 10px 0; }
 
 .system-status-grid {

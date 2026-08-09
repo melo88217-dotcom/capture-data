@@ -240,7 +240,56 @@ test("daily changes keep same-day available follower snapshot when later capture
   assert.equal(rows[0].follower_count_status, "available");
 });
 
-test("daily changes carry the last valid video metrics across a failed capture", () => {
+test("daily changes do not report a follower parser correction as real growth", () => {
+  const account = createAccount({
+    platform: "douyin",
+    display_name: "daily-follower-correction",
+    profile_url: `https://example.com/daily-follower-correction-${process.pid}`,
+    capture_frequency: "daily"
+  });
+  const insertSnapshot = db.prepare(
+    `INSERT INTO account_snapshots (
+      account_id, captured_at, follower_count, follower_count_status, raw_follower_text, source_url
+    ) VALUES (?, ?, ?, 'available', ?, ?)`
+  );
+
+  insertSnapshot.run(account.id, "2026-07-20T01:00:00.000Z", 10_000, "1.0万", account.profile_url);
+  insertSnapshot.run(account.id, "2026-07-21T01:00:00.000Z", 204, "204", account.profile_url);
+  insertSnapshot.run(account.id, "2026-07-22T01:00:00.000Z", 10_000, "1.0万", account.profile_url);
+
+  const rows = listDailyChanges({ account_id: account.id, limit: 10 });
+  const parserErrorDay = rows.find((row) => row.day === "2026-07-21");
+  const correctedDay = rows.find((row) => row.day === "2026-07-22");
+
+  assert.equal(parserErrorDay.follower_delta, null);
+  assert.equal(correctedDay.follower_delta, null);
+});
+
+test("weekly summaries do not treat a follower parser correction as real growth", () => {
+  const account = createAccount({
+    platform: "douyin",
+    display_name: "weekly-follower-correction",
+    profile_url: `https://example.com/weekly-follower-correction-${process.pid}`,
+    capture_frequency: "daily"
+  });
+  const insertSnapshot = db.prepare(
+    `INSERT INTO account_snapshots (
+      account_id, captured_at, follower_count, follower_count_status, raw_follower_text, source_url
+    ) VALUES (?, ?, ?, 'available', ?, ?)`
+  );
+
+  insertSnapshot.run(account.id, "2026-07-20T01:00:00.000Z", 10_000, "1.0万", account.profile_url);
+  insertSnapshot.run(account.id, "2026-07-21T01:00:00.000Z", 204, "204", account.profile_url);
+
+  computeWeeklySummaries(new Date("2026-07-21T12:00:00.000Z"));
+  const summary = db.prepare(
+    "SELECT follower_delta FROM weekly_summaries WHERE account_id = ? ORDER BY id DESC LIMIT 1"
+  ).get(account.id);
+
+  assert.equal(summary.follower_delta, null);
+});
+
+test("daily changes carry valid totals across a failed capture without assigning a multi-day gap to recovery day", () => {
   const account = createAccount({
     platform: "douyin",
     display_name: "daily-video-failed-not-zero",
@@ -286,9 +335,10 @@ test("daily changes carry the last valid video metrics across a failed capture",
   assert.equal(failedDay.comment_delta, 0);
   assert.equal(failedDay.favorite_delta, 0);
   assert.equal(recoveredDay.like_total, 220);
-  assert.equal(recoveredDay.like_delta, 20);
-  assert.equal(recoveredDay.comment_delta, 2);
-  assert.equal(recoveredDay.favorite_delta, 1);
+  assert.equal(recoveredDay.follower_delta, null);
+  assert.equal(recoveredDay.like_delta, null);
+  assert.equal(recoveredDay.comment_delta, null);
+  assert.equal(recoveredDay.favorite_delta, null);
 });
 
 test("daily changes keep prior video totals when a capture returns no videos", () => {
@@ -481,12 +531,13 @@ test("capture persistence quarantines implausible follower and video metric drop
   const topVideo = listTopLikedVideos(10000).find((video) => video.video_url === videoUrl);
   const hotVideo = listHotVideos({ months: "all", limit: 10000 }).find((video) => video.video_url === videoUrl);
 
-  assert.equal(latestAccountSnapshot.follower_count_status, "failed");
+  assert.equal(latestAccountSnapshot.follower_count_status, "available");
   assert.equal(latestVideoSnapshot.like_count_status, "failed");
   assert.equal(latestVideoSnapshot.comment_count_status, "failed");
   assert.equal(latestVideoSnapshot.favorite_count_status, "failed");
-  assert.equal(savedAccount.latest_follower_count, 10000);
-  assert.equal(quality.warnings.length, 4);
+  assert.equal(savedAccount.latest_follower_count, 4);
+  assert.equal(quality.warnings.length, 3);
+  assert.equal(quality.effective_status, "success");
   assert.equal(listedVideo.like_count, 1000);
   assert.equal(listedVideo.comment_count, 100);
   assert.equal(listedVideo.favorite_count, 50);
@@ -549,13 +600,11 @@ test("capture persistence quarantines an isolated upward spike and accepts a cor
   ).all(account.id);
   const listedVideo = listVideos({ account_id: account.id })[0];
 
-  assert.equal(spike.warnings.length, 2);
+  assert.equal(spike.warnings.length, 1);
   assert.equal(recovery.warnings.length, 0);
-  assert.equal(pendingRange.warnings.length, 2);
+  assert.equal(pendingRange.warnings.length, 1);
   assert.equal(confirmedRange.warnings.length, 0);
-  assert.deepEqual(snapshots.map((row) => row.follower_count_status), [
-    "available", "failed", "available", "failed", "available"
-  ]);
+  assert.deepEqual(snapshots.map((row) => row.follower_count_status), Array(5).fill("available"));
   assert.equal(listedVideo.like_count, 10100);
 });
 

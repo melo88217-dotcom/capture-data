@@ -100,7 +100,8 @@ legacy.exec(`
   INSERT INTO accounts (id, platform_id, display_name, profile_url, latest_collect_status)
   VALUES
     (1, 1, 'canonical owner', 'https://example.com/canonical-owner', 'success'),
-    (2, 1, 'follower only repair', 'https://example.com/follower-only-repair', 'success');
+    (2, 1, 'follower only repair', 'https://example.com/follower-only-repair', 'success'),
+    (3, 1, 'follower outlier repair', 'https://example.com/follower-outlier-repair', 'success');
   INSERT INTO capture_jobs (
     id, account_id, platform_id, job_type, trigger_type, status, scheduled_at, started_at, finished_at
   ) VALUES (
@@ -113,6 +114,14 @@ legacy.exec(`
     2, '2026-07-03T01:00:00.000Z', 100, 'available', '100',
     'https://example.com/follower-only-repair', 1
   );
+  INSERT INTO account_snapshots (
+    account_id, captured_at, follower_count, follower_count_status, raw_follower_text, source_url
+  ) VALUES
+    (3, '2026-07-01T01:00:00.000Z', 10000, 'available', '1.0万', 'https://example.com/follower-outlier-repair'),
+    (3, '2026-07-02T01:00:00.000Z', 249, 'available', '249', 'https://example.com/follower-outlier-repair'),
+    (3, '2026-07-03T01:00:00.000Z', 251, 'available', '251', 'https://example.com/follower-outlier-repair'),
+    (3, '2026-07-04T01:00:00.000Z', 5, 'available', '5', 'https://example.com/follower-outlier-repair'),
+    (3, '2026-07-05T01:00:00.000Z', 10000, 'available', '1.0万', 'https://example.com/follower-outlier-repair');
   INSERT INTO videos (id, account_id, video_url, title, first_seen_at)
   VALUES
     (1, 1, 'https://example.com/shared-video', 'canonical', '2026-07-01 00:00:00'),
@@ -151,9 +160,12 @@ test("database startup repairs cross-account duplicates and quarantines historic
     `SELECT like_count_status, comment_count_status, favorite_count_status
      FROM video_snapshots WHERE video_id = 3 ORDER BY captured_at`
   ).all();
+  const followerStatuses = db.prepare(
+    "SELECT follower_count_status FROM account_snapshots WHERE account_id = 3 ORDER BY captured_at"
+  ).all();
 
   assert.equal(repairs.duplicateVideosRemoved, 1);
-  assert.equal(repairs.quarantinedMetrics, 6);
+  assert.equal(repairs.quarantinedMetrics, 11);
   assert.deepEqual(videos.map((row) => [row.id, row.account_id]), [[1, 1], [3, 2]]);
   assert.equal(suspect.like_count_status, "failed");
   assert.equal(suspect.comment_count_status, "failed");
@@ -167,6 +179,9 @@ test("database startup repairs cross-account duplicates and quarantines historic
     { like_count_status: "failed", comment_count_status: "failed", favorite_count_status: "failed" },
     { like_count_status: "available", comment_count_status: "available", favorite_count_status: "available" }
   ]);
+  assert.deepEqual(followerStatuses.map((row) => row.follower_count_status), [
+    "available", "failed", "failed", "failed", "available"
+  ]);
   assert.equal(repairs.followerOnlyJobsReclassified, 1);
   assert.equal(repairedJob.status, "partial_success");
   assert.equal(repairedJob.error_code, "VIDEO_DATA_MISSING");
@@ -178,5 +193,5 @@ test("database startup repairs cross-account duplicates and quarantines historic
     quarantinedMetrics: 0,
     followerOnlyJobsReclassified: 0
   });
-  assert.equal(db.prepare("SELECT COUNT(*) AS count FROM schema_migrations").get().count, 1);
+  assert.equal(db.prepare("SELECT COUNT(*) AS count FROM schema_migrations").get().count, 2);
 });

@@ -200,6 +200,55 @@ test("runCaptureJob does not retry a terminal login failure", async () => {
   assert.equal(finished.error_code, "LOGIN_REQUIRED");
 });
 
+test("a data-quality warning does not downgrade a successful automatic capture", async () => {
+  const accountId = insertAccount("runner-quality-warning");
+  const job = createCaptureJob(accountId, "daily");
+  const videoUrl = `https://www.douyin.com/video/runner-quality-warning-${process.pid}`;
+  const videoId = db
+    .prepare("INSERT INTO videos (account_id, video_url, title) VALUES (?, ?, ?)")
+    .run(accountId, videoUrl, "quality warning video").lastInsertRowid;
+  db.prepare(
+    `INSERT INTO video_snapshots (
+      video_id, captured_at, like_count, comment_count, favorite_count,
+      like_count_status, comment_count_status, favorite_count_status
+    ) VALUES (?, ?, ?, ?, ?, 'available', 'available', 'available')`
+  ).run(videoId, "2026-07-28T01:00:00.000Z", 1_000, 100, 50);
+
+  const finished = await runCaptureJob(job.id, runnerOptions(async () => ({
+    platform: "douyin",
+    account: {
+      display_name: "runner-quality-warning",
+      profile_url: "https://www.douyin.com/user/runner-quality-warning",
+      follower_count: 1_234,
+      follower_count_status: "available",
+      raw_follower_text: "1234"
+    },
+    videos: [{
+      video_url: videoUrl,
+      title: "quality warning video",
+      like_count: 1,
+      comment_count: 1,
+      favorite_count: 1,
+      like_count_status: "available",
+      comment_count_status: "available",
+      favorite_count_status: "available"
+    }],
+    status: "success",
+    error_code: null,
+    error_message: null,
+    captured_at: "2026-07-29T01:00:00.000Z"
+  })));
+
+  assert.equal(finished.status, "success");
+  assert.equal(finished.error_code, "DATA_QUALITY_WARNING");
+  assert.match(finished.error_message, /数据质量校验已排除 3 个异常值/);
+  assert.equal(
+    db.prepare("SELECT COUNT(*) AS count FROM capture_logs WHERE job_id = ? AND message = '采集数据质量校验'").get(job.id)
+      .count,
+    1
+  );
+});
+
 function runnerOptions(collector) {
   return {
     collector,

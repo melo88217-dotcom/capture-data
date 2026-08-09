@@ -578,29 +578,27 @@ function TopLikedVideoTable({ videos }) {
 }
 
 function TrendChart({ rows }) {
+  const missingDays = rows.filter((row) => row.likes == null && row.interactions == null).map((row) => row.label);
   const data = {
     labels: rows.map((row) => row.label),
     datasets: [
-      {
-        label: "粉丝变化",
-        data: rows.map((row) => row.followers),
-        borderColor: "#0f7a5d",
-        backgroundColor: "#0f7a5d",
-        tension: 0.28
-      },
       {
         label: "点赞变化",
         data: rows.map((row) => row.likes),
         borderColor: "#c99252",
         backgroundColor: "#c99252",
-        tension: 0.28
+        tension: 0.28,
+        spanGaps: true,
+        segment: { borderDash: dashAcrossMissingDays }
       },
       {
         label: "互动变化",
         data: rows.map((row) => row.interactions),
         borderColor: "#66736e",
         backgroundColor: "#66736e",
-        tension: 0.28
+        tension: 0.28,
+        spanGaps: true,
+        segment: { borderDash: dashAcrossMissingDays }
       }
     ]
   };
@@ -621,8 +619,18 @@ function TrendChart({ rows }) {
   return (
     <div className="trend-chart-box">
       <Line data={data} options={options} />
+      {missingDays.length > 0 && (
+        <p className="trend-chart-note">
+          <span className="trend-chart-dash" aria-hidden="true" />
+          虚线表示中间有数据缺失，未将缺失日期计入日变化：{missingDays.join("、")}
+        </p>
+      )}
     </div>
   );
+}
+
+function dashAcrossMissingDays(context) {
+  return context.p1DataIndex - context.p0DataIndex > 1 ? [6, 4] : undefined;
 }
 
 function Accounts({ accounts, onCapture, onUpdate, onDelete, onClearData, captureId }) {
@@ -1348,7 +1356,6 @@ function buildSevenDayTrend(rows, accountId = "") {
     return {
       day,
       label: day.slice(5),
-      followers: aggregateDelta(dayRows, "follower_delta"),
       likes: aggregateDelta(dayRows, "like_delta"),
       interactions: aggregateInteractionDelta(dayRows)
     };
@@ -1356,14 +1363,14 @@ function buildSevenDayTrend(rows, accountId = "") {
 }
 
 function aggregateDelta(rows, key) {
-  if (rows.length === 0) return 0;
+  if (rows.length === 0) return null;
   const values = rows.map((row) => row[key]).filter((value) => value != null);
   if (values.length === 0) return null;
   return values.reduce((sum, value) => sum + value, 0);
 }
 
 function aggregateInteractionDelta(rows) {
-  if (rows.length === 0) return 0;
+  if (rows.length === 0) return null;
   const values = rows.map((row) => {
     const parts = [row.comment_delta, row.favorite_delta].filter((value) => value != null);
     return parts.length ? parts.reduce((sum, value) => sum + value, 0) : null;

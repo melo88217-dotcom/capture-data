@@ -634,7 +634,9 @@ export function saveCaptureResult(job, result) {
       );
     }
 
-    const effectiveStatus = warnings.length > 0 && result.status === "success" ? "partial_success" : result.status;
+    const effectiveStatus = warnings.some((warning) => warning.type === "video_account_conflict") && result.status === "success"
+      ? "partial_success"
+      : result.status;
     if (accountMetric.status === "available") {
       db.prepare(
         `
@@ -671,6 +673,7 @@ export function saveCaptureResult(job, result) {
 }
 
 function validateIncomingMetric({ entityType, entityId, metric, value, status, previous, pending, warnings }) {
+  if (entityType === "account" && metric === "follower_count") return { value, status };
   if (status !== "available" || !isImplausibleMetricChange(previous, value)) return { value, status };
   if (pending != null && !isImplausibleMetricChange(pending, value)) return { value, status };
   warnings.push({
@@ -922,14 +925,32 @@ export function listDailyChanges(filters = {}) {
     for (let index = 0; index < ordered.length; index += 1) {
       const current = ordered[index];
       const previous = ordered[index - 1];
+      const hasDailyBaseline = areConsecutiveDays(previous?.day, current.day);
       rows.push({
         ...current,
-        follower_delta: diff(current.follower_count, previous?.follower_count)
+        follower_delta: hasDailyBaseline
+          ? safeFollowerDelta(current.follower_count, previous?.follower_count)
+          : null,
+        like_delta: hasDailyBaseline ? current.like_delta : null,
+        comment_delta: hasDailyBaseline ? current.comment_delta : null,
+        favorite_delta: hasDailyBaseline ? current.favorite_delta : null
       });
     }
   }
 
   return rows.sort((a, b) => b.day.localeCompare(a.day) || a.account_name.localeCompare(b.account_name));
+}
+
+function safeFollowerDelta(current, previous) {
+  if (isImplausibleMetricChange(previous, current)) return null;
+  return diff(current, previous);
+}
+
+function areConsecutiveDays(previousDay, currentDay) {
+  if (!previousDay || !currentDay) return false;
+  const previous = Date.parse(`${previousDay}T00:00:00Z`);
+  const current = Date.parse(`${currentDay}T00:00:00Z`);
+  return Number.isFinite(previous) && Number.isFinite(current) && current - previous === 24 * 60 * 60 * 1000;
 }
 
 function buildDailyRows(account, days) {
@@ -1152,7 +1173,9 @@ export function computeWeeklySummaries(date = new Date()) {
 
     const first = snapshots[0];
     const last = snapshots[snapshots.length - 1];
-    const followerDelta = first && last && snapshots.length > 1 ? last.follower_count - first.follower_count : null;
+    const followerDelta = first && last && snapshots.length > 1
+      ? safeFollowerDelta(last.follower_count, first.follower_count)
+      : null;
     const dataStatus = snapshots.length > 1 ? "complete" : snapshots.length === 1 ? "partial" : "insufficient";
 
     const videoDelta = db
