@@ -12,14 +12,14 @@
 
 默认地址：
 
-- Web：`http://127.0.0.1:3000/`
-- API：`http://127.0.0.1:3001/`
+- Web：`http://127.0.0.1:3102/`（以 `.env.development` 的 `FRONTEND_PORT` 为准）
+- API：`http://127.0.0.1:8102/`（以 `.env.development` 的 `BACKEND_PORT` 为准）
 
 ## 启动方式
 
 ```bash
 npm install
-npm run dev
+npm run dev:safe
 ```
 
 构建检查：

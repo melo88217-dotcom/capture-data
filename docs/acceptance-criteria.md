@@ -55,8 +55,8 @@
 - `npm run build` 可以成功构建前端。
 - `npm audit --omit=dev` 无已知生产依赖漏洞。
 - `npm run dev` 可以启动本地服务。
-- 前端默认地址为 `http://127.0.0.1:3000/`。
-- API 默认地址为 `http://127.0.0.1:3001/`。
+- 前端地址由 `.env.development` 的 `FRONTEND_PORT` 决定；当前项目分配为 `http://127.0.0.1:3102/`。
+- API 地址由 `.env.development` 的 `BACKEND_PORT` 决定；当前项目分配为 `http://127.0.0.1:8102/`。
 - `GET /api/health` 返回 `ok: true` 和 SQLite 数据库路径。
 - SQLite 数据文件保存在 `data/app.sqlite`。
 - 日志文件保存在 `logs/`。

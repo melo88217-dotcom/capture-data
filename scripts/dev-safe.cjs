@@ -32,6 +32,7 @@ async function main() {
   console.log(`[dev:safe] Backend:  http://localhost:${backendPort}`);
 
   apiProcess = spawnCommand(
+    "backend",
     process.execPath,
     [path.join(root, "src", "backend", "server.js")],
     root,
@@ -45,6 +46,7 @@ async function main() {
   );
 
   webProcess = spawnCommand(
+    "frontend",
     process.execPath,
     [
       path.join(root, "node_modules", "vite", "bin", "vite.js"),
@@ -63,8 +65,8 @@ async function main() {
     false
   );
 
-  process.on("SIGINT", shutdown);
-  process.on("SIGTERM", shutdown);
+  process.on("SIGINT", () => shutdown(0));
+  process.on("SIGTERM", () => shutdown(0));
 }
 
 function loadEnv(file) {
@@ -109,7 +111,7 @@ function assertPortFree(port, label) {
   });
 }
 
-function spawnCommand(command, args, cwd, childEnv, shell = process.platform === "win32") {
+function spawnCommand(label, command, args, cwd, childEnv, shell = process.platform === "win32") {
   const child = spawn(command, args, {
     cwd,
     env: childEnv,
@@ -117,17 +119,30 @@ function spawnCommand(command, args, cwd, childEnv, shell = process.platform ===
     shell
   });
 
-  child.on("exit", (code) => {
-    if (!shuttingDown && code && code !== 0) {
-      console.error(`[dev:safe] ${command} exited with code ${code}.`);
-    }
+  child.once("error", (error) => {
+    if (shuttingDown) return;
+    console.error(`[dev:safe] ${label} could not start: ${error.message}`);
+    shutdown(1);
+  });
+
+  child.once("exit", (code, signal) => {
+    if (shuttingDown) return;
+    const result = signal ? `was stopped by ${signal}` : `exited with code ${code ?? 0}`;
+    console.error(`[dev:safe] ${label} ${result}; stopping the remaining project process.`);
+    shutdown(code && code !== 0 ? code : 1);
   });
 
   return child;
 }
 
-function shutdown() {
+function shutdown(exitCode = 0) {
+  if (shuttingDown) return;
   shuttingDown = true;
-  if (webProcess && !webProcess.killed) webProcess.kill();
-  if (apiProcess && !apiProcess.killed) apiProcess.kill();
+  if (exitCode) process.exitCode = exitCode;
+  stopChild(webProcess);
+  stopChild(apiProcess);
+}
+
+function stopChild(child) {
+  if (child && child.exitCode === null && !child.killed) child.kill();
 }
