@@ -112,6 +112,43 @@ test("dashboard account rows include active account video totals and recent vide
   assert.equal(row.recent_video_count, 1);
 });
 
+test("capture persistence exposes the latest public total like count on dashboard rows", () => {
+  const account = createAccount({
+    platform: "douyin",
+    display_name: "dashboard-total-likes",
+    profile_url: `https://example.com/dashboard-total-likes-${process.pid}`,
+    capture_frequency: "daily"
+  });
+  const job = createCaptureJob(account.id, "manual_now");
+
+  saveCaptureResult(job, {
+    captured_at: "2026-09-12T01:00:00.000Z",
+    status: "partial_success",
+    account: {
+      profile_url: account.profile_url,
+      follower_count: 18000,
+      follower_count_status: "available",
+      raw_follower_text: "1.8万",
+      total_like_count: 157000,
+      total_like_count_status: "available",
+      raw_total_like_text: "15.7万"
+    },
+    videos: []
+  });
+
+  const row = listAccountDashboardRows().find((item) => item.id === account.id);
+  const snapshot = db.prepare(
+    `SELECT total_like_count, total_like_count_status, raw_total_like_text
+     FROM account_snapshots WHERE account_id = ? ORDER BY id DESC LIMIT 1`
+  ).get(account.id);
+
+  assert.equal(row.latest_follower_count, 18000);
+  assert.equal(row.latest_total_like_count, 157000);
+  assert.equal(snapshot.total_like_count, 157000);
+  assert.equal(snapshot.total_like_count_status, "available");
+  assert.equal(snapshot.raw_total_like_text, "15.7万");
+});
+
 test("top liked videos use latest real like count and exclude inactive accounts", () => {
   const account = createAccount({
     platform: "douyin",

@@ -105,3 +105,16 @@ test("account capture video limit defaults to 10 and can be customized", () => {
 
   assert.equal(getAccount(account.id).capture_video_limit, 25);
 });
+
+test("capture jobs retain the account video limit for scheduled collection", () => {
+  const account = createAccount({
+    platform: "douyin",
+    display_name: "scheduled-video-limit-test",
+    profile_url: `https://example.com/scheduled-video-limit-${process.pid}`,
+    capture_frequency: "daily",
+    capture_video_limit: 5
+  });
+  const job = createCaptureJob(account.id, "scheduled");
+
+  assert.equal(getCaptureJob(job.id).capture_video_limit, 5);
+});

@@ -27,3 +27,13 @@ test("time and numeric account settings save after editing instead of on every k
   assert.match(table, /onBlur=\{commitLikeThreshold\}/);
   assert.doesNotMatch(table, /onChange=\{\(event\) => onUpdate\(account\.id/);
 });
+
+test("dashboard labels locally collected works instead of implying the platform total", () => {
+  const dashboard = source.slice(
+    source.indexOf("function DashboardAccountTable"),
+    source.indexOf("function TopLikedVideoTable")
+  );
+
+  assert.match(dashboard, />已采集作品<\/th>/);
+  assert.match(dashboard, /不等于平台主页显示的总作品数/);
+});

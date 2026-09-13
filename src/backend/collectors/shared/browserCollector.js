@@ -103,6 +103,7 @@ export async function collectPublicPage(account, options = {}) {
     }
     const profileText = await getBodyText(page);
     const follower = await getProfileFollower(page);
+    const totalLikes = await getProfileTotalLikes(page);
     const profileUrl = page.url();
     rememberCanonicalProfileUrl(account, profileUrl);
     const profileVideos = await extractDouyinProfileVideos(page, limit);
@@ -112,6 +113,7 @@ export async function collectPublicPage(account, options = {}) {
       body_text_length: profileText.length,
       video_link_count: profileVideos.length,
       follower_status: follower.status,
+      total_like_status: totalLikes.status,
       request_failures: requestFailures
     };
     const videos = [];
@@ -137,7 +139,10 @@ export async function collectPublicPage(account, options = {}) {
         profile_url: profileUrl || account.profile_url,
         follower_count: follower.value,
         follower_count_status: follower.status,
-        raw_follower_text: follower.raw
+        raw_follower_text: follower.raw,
+        total_like_count: totalLikes.value,
+        total_like_count_status: totalLikes.status,
+        raw_total_like_text: totalLikes.raw
       },
       videos,
       ...classification,
@@ -249,23 +254,64 @@ async function collectVideoDetail(page, item) {
   }
 }
 
-async function extractDouyinProfileVideos(page, limit) {
-  const links = await page
+export async function extractDouyinProfileVideos(page, limit, options = {}) {
+  const targetCount = Math.max(1, Number(limit) || 10);
+  const loadTimeoutMs = readNonNegativeNumber(
+    options.loadTimeoutMs ?? process.env.CAPTURE_PROFILE_VIDEO_LOAD_TIMEOUT_MS,
+    8_000
+  );
+  const scrollWaitMs = Math.max(
+    100,
+    readNonNegativeNumber(options.scrollWaitMs ?? process.env.CAPTURE_PROFILE_VIDEO_SCROLL_WAIT_MS, 900)
+  );
+  const startedAt = Date.now();
+  let idleRounds = 0;
+  let previousLinkCount = -1;
+
+  while (true) {
+    const links = await readDouyinProfileVideoLinks(page);
+    const videos = buildDouyinProfileVideos(links, targetCount);
+    if (videos.length >= targetCount) return videos;
+
+    const hasTimedOut = Date.now() - startedAt >= loadTimeoutMs;
+    idleRounds = links.length === previousLinkCount ? idleRounds + 1 : 0;
+    // A short bounded scroll catches lazy-loaded cards after pinned videos without
+    // delaying accounts that genuinely have fewer public non-pinned works.
+    if (hasTimedOut || idleRounds >= 3) return videos;
+
+    previousLinkCount = links.length;
+    await page.mouse.wheel(0, 900).catch(() => {});
+    await page.waitForTimeout(scrollWaitMs);
+  }
+}
+
+async function readDouyinProfileVideoLinks(page) {
+  return page
     .locator("a")
-    .evaluateAll((nodes) =>
-      nodes
+    .evaluateAll((nodes) => {
+      const textOf = (element) => String(element?.innerText || element?.textContent || "").trim();
+      const hasPinnedBadge = (node) => {
+        let branch = node;
+        // Stop at the card container: checking the shared video grid could incorrectly
+        // apply one card's badge to every video link in that grid.
+        for (let depth = 0; branch && depth < 2; depth += 1, branch = branch.parentElement) {
+          if (textOf(branch).split(/\r?\n/).some((line) => line.trim() === "置顶")) return true;
+          if (Array.from(branch.querySelectorAll("*")).some((child) => textOf(child) === "置顶")) return true;
+        }
+        return false;
+      };
+      return nodes
         .map((node) => ({
           href: node.href,
-          text: (node.innerText || node.textContent || "").trim(),
+          text: textOf(node),
           label: (node.getAttribute("aria-label") || node.querySelector("img")?.getAttribute("alt") || "").trim(),
           hasMedia: Boolean(node.querySelector("img, video, picture")),
-          visible: node.getBoundingClientRect().width >= 40 && node.getBoundingClientRect().height >= 40
+          visible: node.getBoundingClientRect().width >= 40 && node.getBoundingClientRect().height >= 40,
+          is_pinned: hasPinnedBadge(node)
         }))
-        .filter((item) => item.href)
-    )
+        .filter((item) => item.href);
+    })
     .catch(() => []);
-
-  return buildDouyinProfileVideos(links, limit);
 }
 
 export function buildDouyinProfileVideos(links, limit) {
@@ -275,6 +321,7 @@ export function buildDouyinProfileVideos(links, limit) {
   for (const item of links) {
     const cleanUrl = normalizeDouyinVideoUrl(item.href);
     if (!cleanUrl || seen.has(cleanUrl)) continue;
+    if (item.is_pinned) continue;
     const parsed = parseProfileVideoText([item.text, item.label].filter(Boolean).join("\n"));
     if (!parsed.title && parsed.like_count == null && !(item.hasMedia && item.visible)) continue;
 
@@ -478,9 +525,17 @@ function extractPublishedAt(text) {
 }
 
 export function extractFollower(metricItems) {
+  return extractProfileMetric(metricItems, "(?:\\u7c89\\u4e1d|followers)");
+}
+
+export function extractTotalLikes(metricItems) {
+  return extractProfileMetric(metricItems, "(?:\\u83b7\\u8d5e|likes?)");
+}
+
+function extractProfileMetric(metricItems, labelPattern) {
   const values = Array.isArray(metricItems) ? metricItems : [metricItems];
   const parsed = values
-    .map(extractFollowerMetricItem)
+    .map((value) => extractProfileMetricItem(value, labelPattern))
     .filter((item) => item.status === "available");
   const distinctValues = new Set(parsed.map((item) => item.value));
 
@@ -492,20 +547,29 @@ export function extractFollower(metricItems) {
   };
 }
 
-function extractFollowerMetricItem(value) {
+function extractProfileMetricItem(value, labelPattern) {
   const compact = String(value || "").replace(/\s+/g, "");
   const metricPattern = "([0-9]+(?:\\.[0-9]+)?(?:\\u4e07|w|W|\\u4ebf)?\\+?)";
-  const metricBeforeLabel = compact.match(new RegExp(`^${metricPattern}(?:\\u7c89\\u4e1d|followers)$`, "i"));
-  const labelBeforeMetric = compact.match(new RegExp(`^(?:\\u7c89\\u4e1d|followers)${metricPattern}$`, "i"));
+  const metricBeforeLabel = compact.match(new RegExp(`^${metricPattern}${labelPattern}$`, "i"));
+  const labelBeforeMetric = compact.match(new RegExp(`^${labelPattern}${metricPattern}$`, "i"));
   const candidate = metricBeforeLabel?.[1] || labelBeforeMetric?.[1];
   return candidate ? parseMetricLine(candidate) : { value: null, status: "unknown", raw: "" };
 }
 
 export async function getProfileFollower(page) {
+  return getProfileMetric(page, "(?:粉丝|followers)", "(?:粉丝|followers)");
+}
+
+export async function getProfileTotalLikes(page) {
+  return getProfileMetric(page, "(?:获赞|likes?)", "(?:获赞|likes?)");
+}
+
+async function getProfileMetric(page, labelPattern, extractLabelPattern) {
   const metricItems = await page
-    .evaluate(() => {
+    .evaluate((pageLabelPattern) => {
+      const labelPattern = pageLabelPattern;
       const metricPattern = "[0-9]+(?:\\.[0-9]+)?(?:万|w|W|亿)?\\+?";
-      const directMetric = new RegExp(`^(?:${metricPattern})(?:粉丝|followers)$|^(?:粉丝|followers)(?:${metricPattern})$`, "i");
+      const directMetric = new RegExp(`^(?:${metricPattern})${labelPattern}$|^${labelPattern}(?:${metricPattern})$`, "i");
       const normalize = (value) => String(value || "").replace(/\s+/g, "").trim();
       const getText = (element) => normalize(element.innerText || element.textContent || "");
       const belongsToProfileHeader = (element) => {
@@ -522,11 +586,11 @@ export async function getProfileFollower(page) {
       const items = new Set();
       const elements = Array.from(document.body?.querySelectorAll("*") || []);
 
-      const followerLabels = elements.filter((element) => {
+      const metricLabels = elements.filter((element) => {
         const text = getText(element);
-        return /^(?:粉丝|followers)$/i.test(text) && belongsToProfileHeader(element);
+        return new RegExp(`^${labelPattern}$`, "i").test(text) && belongsToProfileHeader(element);
       });
-      for (const label of followerLabels) {
+      for (const label of metricLabels) {
         let branch = label;
         for (let depth = 0; depth < 3 && branch.parentElement; depth += 1) {
           const parent = branch.parentElement;
@@ -537,9 +601,9 @@ export async function getProfileFollower(page) {
       }
 
       return Array.from(items);
-    })
+    }, labelPattern)
     .catch(() => []);
-  return extractFollower(metricItems);
+  return extractProfileMetric(metricItems, extractLabelPattern);
 }
 
 async function checkBlocked(page) {

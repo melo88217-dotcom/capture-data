@@ -46,6 +46,7 @@ export function initDatabase() {
       like_alert_threshold INTEGER NOT NULL DEFAULT 0,
       is_active INTEGER NOT NULL DEFAULT 1,
       latest_follower_count INTEGER,
+      latest_total_like_count INTEGER,
       latest_collect_status TEXT DEFAULT 'unknown',
       last_captured_at TEXT,
       created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -60,6 +61,9 @@ export function initDatabase() {
       follower_count INTEGER,
       follower_count_status TEXT NOT NULL,
       raw_follower_text TEXT,
+      total_like_count INTEGER,
+      total_like_count_status TEXT NOT NULL DEFAULT 'unknown',
+      raw_total_like_text TEXT,
       source_url TEXT,
       capture_job_id INTEGER,
       created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
@@ -164,6 +168,10 @@ export function initDatabase() {
   ensureColumn("accounts", "preferred_capture_time", "TEXT NOT NULL DEFAULT '09:00'");
   ensureColumn("accounts", "capture_video_limit", "INTEGER NOT NULL DEFAULT 10");
   ensureColumn("accounts", "like_alert_threshold", "INTEGER NOT NULL DEFAULT 0");
+  ensureColumn("accounts", "latest_total_like_count", "INTEGER");
+  ensureColumn("account_snapshots", "total_like_count", "INTEGER");
+  ensureColumn("account_snapshots", "total_like_count_status", "TEXT NOT NULL DEFAULT 'unknown'");
+  ensureColumn("account_snapshots", "raw_total_like_text", "TEXT");
   const integrityRepairs = runDataIntegrityMigration();
   const followerOutliersQuarantined = runFollowerOutlierMigration();
   createLookupIndexes();

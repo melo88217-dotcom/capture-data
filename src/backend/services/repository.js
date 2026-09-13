@@ -248,6 +248,7 @@ export function clearAccountCaptureData(id) {
       `
       UPDATE accounts
       SET latest_follower_count = NULL,
+          latest_total_like_count = NULL,
           latest_collect_status = 'unknown',
           last_captured_at = NULL,
           updated_at = CURRENT_TIMESTAMP
@@ -357,6 +358,7 @@ export function getCaptureJob(id) {
         a.tags,
         a.notes,
         a.capture_frequency,
+        a.capture_video_limit,
         a.is_active,
         p.code AS platform_code,
         p.name AS platform_name
@@ -499,9 +501,12 @@ export function saveCaptureResult(job, result) {
   const insertSnapshot = db.prepare(
     `
     INSERT INTO account_snapshots (
-      account_id, captured_at, follower_count, follower_count_status, raw_follower_text, source_url, capture_job_id
+      account_id, captured_at,
+      follower_count, follower_count_status, raw_follower_text,
+      total_like_count, total_like_count_status, raw_total_like_text,
+      source_url, capture_job_id
     )
-    VALUES (?, ?, ?, ?, ?, ?, ?)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `
   );
   const findVideo = db.prepare("SELECT id, account_id FROM videos WHERE video_url = ? ORDER BY id LIMIT 1");
@@ -564,6 +569,9 @@ export function saveCaptureResult(job, result) {
       sqlValue(accountMetric.value),
       sqlValue(accountMetric.status),
       sqlValue(result.account.raw_follower_text),
+      sqlValue(result.account.total_like_count),
+      sqlValue(result.account.total_like_count_status || "not_public"),
+      sqlValue(result.account.raw_total_like_text),
       sqlValue(result.account.profile_url),
       job.id
     );
@@ -637,28 +645,25 @@ export function saveCaptureResult(job, result) {
     const effectiveStatus = warnings.some((warning) => warning.type === "video_account_conflict") && result.status === "success"
       ? "partial_success"
       : result.status;
-    if (accountMetric.status === "available") {
-      db.prepare(
-        `
-        UPDATE accounts
-        SET latest_follower_count = ?,
-            latest_collect_status = ?,
-            last_captured_at = ?,
-            updated_at = CURRENT_TIMESTAMP
-        WHERE id = ?
+    db.prepare(
       `
-      ).run(accountMetric.value, effectiveStatus, result.captured_at, job.account_id);
-    } else {
-      db.prepare(
-        `
-        UPDATE accounts
-        SET latest_collect_status = ?,
-            last_captured_at = ?,
-            updated_at = CURRENT_TIMESTAMP
-        WHERE id = ?
-      `
-      ).run(effectiveStatus, result.captured_at, job.account_id);
-    }
+      UPDATE accounts
+      SET latest_follower_count = CASE WHEN ? = 'available' THEN ? ELSE latest_follower_count END,
+          latest_total_like_count = CASE WHEN ? = 'available' THEN ? ELSE latest_total_like_count END,
+          latest_collect_status = ?,
+          last_captured_at = ?,
+          updated_at = CURRENT_TIMESTAMP
+      WHERE id = ?
+    `
+    ).run(
+      accountMetric.status,
+      accountMetric.value,
+      result.account.total_like_count_status || "not_public",
+      sqlValue(result.account.total_like_count),
+      effectiveStatus,
+      result.captured_at,
+      job.account_id
+    );
 
     db.exec("COMMIT");
     return {
@@ -673,7 +678,7 @@ export function saveCaptureResult(job, result) {
 }
 
 function validateIncomingMetric({ entityType, entityId, metric, value, status, previous, pending, warnings }) {
-  if (entityType === "account" && metric === "follower_count") return { value, status };
+  if (entityType === "account") return { value, status };
   if (status !== "available" || !isImplausibleMetricChange(previous, value)) return { value, status };
   if (pending != null && !isImplausibleMetricChange(pending, value)) return { value, status };
   warnings.push({

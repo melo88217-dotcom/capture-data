@@ -200,6 +200,34 @@ test("runCaptureJob does not retry a terminal login failure", async () => {
   assert.equal(finished.error_code, "LOGIN_REQUIRED");
 });
 
+test("daily collection passes the configured video limit to its collector", async () => {
+  const accountId = insertAccount("runner-daily-video-limit", { captureVideoLimit: 5 });
+  const job = createCaptureJob(accountId, "daily");
+  let receivedLimit = null;
+
+  const finished = await runCaptureJob(job.id, runnerOptions(async (account) => {
+    receivedLimit = account.capture_video_limit;
+    return {
+      platform: "douyin",
+      account: {
+        display_name: "runner-daily-video-limit",
+        profile_url: "https://www.douyin.com/user/runner-daily-video-limit",
+        follower_count: 100,
+        follower_count_status: "available",
+        raw_follower_text: "100"
+      },
+      videos: [],
+      status: "success",
+      error_code: null,
+      error_message: null,
+      captured_at: new Date().toISOString()
+    };
+  }));
+
+  assert.equal(finished.status, "success");
+  assert.equal(receivedLimit, 5);
+});
+
 test("a data-quality warning does not downgrade a successful automatic capture", async () => {
   const accountId = insertAccount("runner-quality-warning");
   const job = createCaptureJob(accountId, "daily");
@@ -261,11 +289,11 @@ function runnerOptions(collector) {
   };
 }
 
-function insertAccount(slug) {
+function insertAccount(slug, { captureVideoLimit = 10 } = {}) {
   const platform = db.prepare("SELECT id FROM platforms WHERE code = 'douyin'").get();
   return db
-    .prepare("INSERT INTO accounts (platform_id, display_name, profile_url) VALUES (?, ?, ?)")
-    .run(platform.id, slug, `https://www.douyin.com/user/${slug}`).lastInsertRowid;
+    .prepare("INSERT INTO accounts (platform_id, display_name, profile_url, capture_video_limit) VALUES (?, ?, ?, ?)")
+    .run(platform.id, slug, `https://www.douyin.com/user/${slug}`, captureVideoLimit).lastInsertRowid;
 }
 
 async function waitForEvent(events, expected) {

@@ -488,7 +488,8 @@ function DashboardAccountTable({ accounts, onGo }) {
             <th>账号信息</th>
             <th>平台</th>
             <th>粉丝数</th>
-            <th>视频数</th>
+            <th>获赞量</th>
+            <th title="系统已累计采集并去重保存的作品数，不等于平台主页显示的总作品数">已采集作品</th>
             <th>近 7 日作品</th>
             <th>自动频率</th>
             <th>状态</th>
@@ -507,6 +508,7 @@ function DashboardAccountTable({ accounts, onGo }) {
               </td>
               <td><Badge>{account.platform_name}</Badge></td>
               <td>{formatMetric(account.latest_follower_count, account.latest_follower_count == null ? "平台未公开" : "--")}</td>
+              <td>{formatMetric(account.latest_total_like_count, account.latest_total_like_count == null ? "平台未公开" : "--")}</td>
               <td>{formatNumber(account.video_count || 0)}</td>
               <td>{formatNumber(account.recent_video_count || 0)}</td>
               <td>{frequencyLabels[account.capture_frequency] || account.capture_frequency}</td>
